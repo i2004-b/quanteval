@@ -1,0 +1,15 @@
+# tells git to ignore data, outputs, caches, and venv
+# Ignore datasets and cache
+data/*
+!data/cifar10.py
+!data/sst2.py
+
+# Ignore outputs (checkpoints, logs, plots)
+outputs/*
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore virtual environments
+.venv/
