@@ -36,6 +36,7 @@
 
 ## Setup
 ```bash
+BE IN CMD NOT POWERSHELL
 python -m venv .venv
 .venv\Scripts\activate.bat  # Windows
 pip install -r requirements.txt
