@@ -37,5 +37,5 @@
 ## Setup
 ```bash
 python -m venv .venv
-.venv\Scripts\activate  # Windows
+.venv\Scripts\activate.bat  # Windows
 pip install -r requirements.txt
