@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Train CIFAR-10 Baseline",
+      "type": "shell",
+      "command": "python",
+      "args": ["scripts/train_cifar10.py"],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Train SST-2 Baseline",
+      "type": "shell",
+      "command": "python",
+      "args": ["scripts/train_sst2.py"],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
