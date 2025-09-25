@@ -1,4 +1,6 @@
 # scripts/train_sst2.py
+# Fine-tune a DistilBERT model on the SST-2 sentiment analysis dataset using HuggingFace Transformers.
+
 from datasets import load_dataset
 from transformers import DistilBertForSequenceClassification, DistilBertTokenizerFast, Trainer, TrainingArguments
 

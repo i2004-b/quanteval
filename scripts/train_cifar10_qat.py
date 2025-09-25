@@ -1,4 +1,7 @@
 # scripts/train_cifar10_qat.py
+# Quantization-Aware Training (QAT) of a ResNet18 on CIFAR-10 using PyTorch.
+# Starts from a pretrained FP32 baseline model (models/resnet18_baseline.pth)
+# Outputs quantized INT8 model weights to models/resnet18_quantized_qat.pth
 import torch
 import torch.nn as nn
 import torch.optim as optim

@@ -2,6 +2,7 @@
 # Train a ResNet18 on CIFAR-10 from scratch using PyTorch.
 # Achieves ~92% accuracy after 60 epochs with standard augmentations.
 # Outputs model checkpoints and training history to models/resnet18_baseline.pth
+# Baseline FP32 model
 import os, platform, time, random, json
 import numpy as np
 import torch

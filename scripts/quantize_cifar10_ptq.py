@@ -1,4 +1,6 @@
 # scripts/quantize_cifar10_ptq.py
+# Post-Training Quantization (PTQ) of a pretrained ResNet18 on CIFAR-10 using PyTorch.
+# Loads a FP32 baseline model from models/resnet18_baseline.pth
 import torch
 import torchvision
 import torch.quantization as tq
