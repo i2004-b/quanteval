@@ -5,9 +5,12 @@ import torch
 import torchvision
 import torch.quantization as tq
 import time, os
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]        #uses path relative to the repo
+BASELINE = ROOT / "models" / "resnet18_baseline.pth"
 
 # 1. Load the FP32 baseline ResNet18 model
-fp32_weights = "../models/resnet18_baseline.pth"
+fp32_weights = str(BASELINE)
 # Use the quantization-aware resnet18 architecture to load weights, so we can easily fuse and quantize
 model = torchvision.models.quantization.resnet18(weights=None, num_classes=10, quantize=False)
 model.load_state_dict(torch.load(fp32_weights))
