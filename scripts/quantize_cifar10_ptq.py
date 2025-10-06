@@ -7,7 +7,7 @@ import torch.quantization as tq
 import time, os
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]        #uses path relative to the repo
-BASELINE = ROOT / "models" / "resnet18_baseline.pth"
+BASELINE = ROOT / "models" / "resnet18_baseline.pt"
 
 # 1. Load the FP32 baseline ResNet18 model
 fp32_weights = str(BASELINE)
@@ -76,7 +76,9 @@ print(f"PTQ INT8 ResNet18 Accuracy: {accuracy:.2f}% (vs FP32 baseline).")
 print(f"Inference time on CPU for {total} images: {inference_time:.2f} seconds.")
 
 # 7. Save the quantized model weights
-save_path = "../models/resnet18_quantized_ptq.pth"
+MODELS = ROOT / "models"
+
+save_path = "models/resnet18_quantized_ptq.pt"
 torch.save(quantized_model.state_dict(), save_path)
 print(f"Saved PTQ INT8 model to {save_path}")
 
@@ -84,3 +86,55 @@ print(f"Saved PTQ INT8 model to {save_path}")
 fp32_size = os.path.getsize(fp32_weights) / 1e6  # in MB
 int8_size = os.path.getsize(save_path) / 1e6     # in MB
 print(f"FP32 model size: {fp32_size:.2f} MB, Quantized INT8 model size: {int8_size:.2f} MB")
+
+# --- JSON report (append-only) ---
+import json
+from datetime import datetime
+
+# where to store the report
+REPORT_DIR = ROOT / "outputs" / "reports" / "resnet18_cifar10_ptq"
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_PATH = REPORT_DIR / "report.json"
+
+# compute a couple extra fields
+per_image_ms = (inference_time / total) * 1000.0 if total else None
+calibration_samples = min(num_calib_batches * calib_loader.batch_size, len(calib_dataset))
+
+report = {
+    "timestamp": datetime.now().isoformat(timespec="seconds"),
+    "task": "cifar10",
+    "model": "resnet18",
+    "quant_method": "ptq_static_int8",
+    "backend": "fbgemm",
+    "paths": {
+        "baseline_fp32": fp32_weights,
+        "quantized_int8": save_path,
+        "report_json": str(REPORT_PATH),
+        "repo_root": str(ROOT),
+    },
+    "settings": {
+        "num_calib_batches": num_calib_batches,
+        "calibration_samples": calibration_samples,
+        "test_batch_size": 128
+    },
+    "metrics": {
+        "accuracy_top1_percent": round(accuracy, 2),
+        "inference_time_total_s": round(inference_time, 3),
+        "latency_per_image_ms": None if per_image_ms is None else round(per_image_ms, 4),
+        "model_size_mb": {
+            "fp32": round(fp32_size, 2),
+            "int8": round(int8_size, 2)
+        }
+    },
+    "env": {
+        "torch": torch.__version__,
+        "torchvision": torchvision.__version__,
+        "device_eval": "cpu"
+    }
+}
+
+with open(REPORT_PATH, "w") as f:
+    json.dump(report, f, indent=2)
+
+print(f"Wrote PTQ JSON report -> {REPORT_PATH}")
+# --- end JSON report ---
