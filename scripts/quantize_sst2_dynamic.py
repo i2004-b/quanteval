@@ -1,4 +1,7 @@
 # scripts/quantize_sst2_dynamic.py
+# Dynamic Quantization of a fine-tuned DistilBERT model on SST-2 using PyTorch.
+# Loads a fine-tuned FP32 model from models/distilbert_baseline
+# Saves quantized INT8 model weights to models/distilbert_quantized_dynamic.pth
 import torch
 from transformers import DistilBertForSequenceClassification
 

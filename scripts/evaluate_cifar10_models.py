@@ -1,4 +1,6 @@
 # scripts/evaluate_cifar10_models.py
+# Compare baseline FP32, PTQ INT8, and QAT INT8 ResNet18 models on CIFAR-10.
+# Reports accuracy, latency (inference time), and model size for each.
 import torch
 import torchvision
 import time, os
