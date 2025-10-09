@@ -1,4 +1,4 @@
-import os, tempfile, torch, psutil, gc
+import os, tempfile, torch, gc #psutil
 def param_bytes(model): 
     return sum(p.numel() * p.element_size() for p in model.parameters())
 def on_disk_bytes_state_dict(model):

@@ -7,3 +7,4 @@ scikit-learn
 pandas
 matplotlib
 tqdm
+streamlit #for ui
