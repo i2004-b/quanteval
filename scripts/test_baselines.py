@@ -14,7 +14,7 @@ SST2_PATH = "outputs/baselines/distilbert_sst2"
 # ---------------- CIFAR-10 Test ----------------
 def test_cifar10():
     if not os.path.exists(CIFAR_PATH):
-        print(f"❌ CIFAR-10 checkpoint not found at {CIFAR_PATH}")
+        print(f"CIFAR-10 checkpoint not found at {CIFAR_PATH}")
         return
 
     print("🔹 Testing CIFAR-10 ResNet18...")
