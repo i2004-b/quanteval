@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 import sys, os
 from torchvision.models import resnet18
 from transformers import DistilBertForSequenceClassification
+import pandas as pd
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # Import utilities 
@@ -137,7 +138,7 @@ if st.button("Run evaluation"):
                 model_loaded = True
                 
             elif model_type.startswith("distilbert"):
-                model = DistilBertForSequenceClassification.from_pretrained(SST2_PATH)
+                model = DistilBertForSequenceClassification.from_pretrained(SST2_PATH, local_files_only=True)
                 model_loaded = True
                 
             else:
@@ -196,9 +197,13 @@ if st.button("Run evaluation"):
         st.subheader("Results")
         for k,v in metrics.items():
             st.metric(k, round(v, 6) if isinstance(v, float) else v)
+        st.bar_chart(pd.DataFrame.from_dict(metrics, orient='index', columns=['Value']))
         st.json(metrics)
 
         # save run record using your report utility
         rec = log_experiment(metrics, model_name=model_type, dataset=("CIFAR-10" if "resnet" in model_type else "SST-2"), method="ui-eval", out_dir="outputs/reports")
         st.success("Logged experiment to outputs/reports")
         st.write(rec)
+        
+if __name__ == "__main__":
+    st.write("Run with:  streamlit run ui/app.py")

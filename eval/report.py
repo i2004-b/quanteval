@@ -14,6 +14,7 @@ def write_csv_row(row, out_path, header):
         w.writerow(row)
 
 def add_timestamp(d):
+    import datetime
     d["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
     return d
 
@@ -46,9 +47,14 @@ def log_experiment(metrics, model_name, dataset, method, out_dir="outputs/report
 
     return record
 
-def read_results(csv_path="outputs/reports/all_results.csv"):
+""" def read_results(csv_path="outputs/reports/all_results.csv"):
     if not os.path.exists(csv_path):
         return []
     with open(csv_path, "r") as f:
         reader = csv.DictReader(f)
-        return list(reader)
+        return list(reader) """
+    
+def read_results(path):
+    import json
+    with open(path, "r") as f:
+        return json.load(f)
