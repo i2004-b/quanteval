@@ -1,5 +1,5 @@
 # scripts/quantize_cifar10_ptq.py
-# Post-Training Quantization (PTQ) of a pretrained ResNet18 on CIFAR-10 using PyTorch.
+# Post-Training Quantization (PTQ) INT8 of a pretrained ResNet18 on CIFAR-10 using PyTorch.
 # Loads a FP32 baseline model from models/resnet18_baseline.pth
 import torch
 import torchvision
@@ -11,7 +11,7 @@ BASELINE = ROOT / "models" / "resnet18_baseline.pt"
 
 # 1. Load the FP32 baseline ResNet18 model
 fp32_weights = str(BASELINE)
-# Use the quantization-aware resnet18 architecture to load weights, so we can easily fuse and quantize
+# Use the quantization-aware resnet18 architecture to load weights, can easily fuse and quantize
 model = torchvision.models.quantization.resnet18(weights=None, num_classes=10, quantize=False)
 model.load_state_dict(torch.load(fp32_weights))
 model.eval()
@@ -23,7 +23,6 @@ print("Fused Conv, BN, ReLU layers for PTQ.")
 
 # 3. Set quantization configuration and prepare the model
 model.qconfig = tq.get_default_qconfig('fbgemm')
-# (If running on ARM devices, use 'qnnpack' instead of 'fbgemm')
 tq.prepare(model, inplace=True)
 print("Inserted observers for PTQ (calibration).")
 
@@ -38,7 +37,7 @@ calib_dataset = CIFAR10(root='./data', train=False, download=True,
                             transforms.Normalize((0.4914,0.4822,0.4465), (0.2470,0.2435,0.2616))
                         ]))
 calib_loader = torch.utils.data.DataLoader(calib_dataset, batch_size=128, shuffle=False)
-# Run through a few batches to calibrate (we don't need to use all data; let's use 1000 samples or so)
+# Run through a few batches to calibrate (use 1000 samples or so)
 num_calib_batches = 10
 batch_count = 0
 with torch.no_grad():

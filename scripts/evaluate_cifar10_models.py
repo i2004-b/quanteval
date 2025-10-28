@@ -1,80 +1,255 @@
 # scripts/evaluate_cifar10_models.py
-# Compare baseline FP32, PTQ INT8, and QAT INT8 ResNet18 models on CIFAR-10.
-# Reports accuracy, latency (inference time), and model size for each.
+# Compare CIFAR-10 models: FP32 baseline vs PTQ INT8 vs QAT INT8 (CPU latency/accuracy/size)
+
+import os, time, json, platform
+from pathlib import Path
+
 import torch
-import torchvision
-import time, os
+import torch.nn as nn
+import torch.ao.quantization as tq
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, models
+torch.backends.quantized.engine = "fbgemm"  # x86 CPU quant backend
 
-# Ensure we run on CPU for all models to have a fair comparison, since quantized models are CPU-only.
-device = torch.device('cpu')
-torch.set_num_threads(1)  # (optional) use single-thread for fair timing, or adjust as needed
 
-# 1. Load baseline FP32 model
-baseline_model = torchvision.models.resnet18(weights=None, num_classes=10)
-baseline_weights = "../models/resnet18_baseline.pth"
-baseline_model.load_state_dict(torch.load(baseline_weights))
-baseline_model.to(device).eval()
-print("Loaded baseline ResNet18.")
+# ---------- paths ----------
+ROOT = Path(__file__).resolve().parents[1]
+MODELS = ROOT / "models"
+OUT = ROOT / "outputs" / "reports" / "cifar10_eval"
+OUT.mkdir(parents=True, exist_ok=True)
 
-# 2. Load PTQ quantized model (INT8)
-ptq_model = torchvision.models.quantization.resnet18(weights=None, num_classes=10, quantize=False)
-ptq_model.load_state_dict(torch.load("../models/resnet18_quantized_ptq.pth"))
-ptq_model.to(device).eval()
-print("Loaded PTQ quantized ResNet18.")
+# Expected files (use whatever exists)
+BASELINE_CANDIDATES = [
+    MODELS / "resnet18_baseline.pt",
+    ROOT / "outputs/baselines/resnet18_cifar10_best.pt",
+    ROOT / "outputs/baselines/resnet18_cifar10_last.pt",
+]
+PTQ_CANDIDATES = [
+    MODELS / "resnet18_quantized_ptq.pt",
+]
+QAT_CANDIDATES = [
+    MODELS / "resnet18_quantized_qat.pt",
+]
 
-# 3. Load QAT quantized model (INT8)
-qat_model = torchvision.models.quantization.resnet18(weights=None, num_classes=10, quantize=False)
-qat_model.load_state_dict(torch.load("../models/resnet18_quantized_qat.pth"))
-qat_model.to(device).eval()
-print("Loaded QAT quantized ResNet18.")
+def pick_first_existing(paths):
+    for p in paths:
+        if p.exists():
+            return p
+    return None
 
-# Note: We loaded quantized model weights into a QuantizableResNet architecture. 
-# These weights are already in int8 (packed), but to use them, we should ideally convert the model to a quantized version.
-# However, since we saved state_dict after conversion, loading it back into the quantization-aware model should give a working int8 model.
-# If any issue arises, we might need to do a prepare/convert step, but it should not be necessary here.
+BASELINE = pick_first_existing(BASELINE_CANDIDATES)
+PTQ_INT8 = pick_first_existing(PTQ_CANDIDATES)
+QAT_INT8 = pick_first_existing(QAT_CANDIDATES)
 
-# 4. Prepare CIFAR-10 test data loader
-from torchvision.datasets import CIFAR10
-from torchvision import transforms
-test_dataset = CIFAR10(root='./data', train=False, download=True,
-                       transform=transforms.Compose([
-                           transforms.ToTensor(),
-                           transforms.Normalize((0.4914,0.4822,0.4465), (0.2470,0.2435,0.2616))
-                       ]))
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=100, shuffle=False)
+# ---------- data ----------
+def make_loader(batch_size=128):
+    mean=(0.4914,0.4822,0.4465); std=(0.2470,0.2435,0.2616)
+    tfm = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean,std),
+    ])
+    test_ds = datasets.CIFAR10(str(ROOT / "data"), train=False, download=True, transform=tfm)
+    workers = 0 if platform.system()=="Windows" else 2
+    return DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                      num_workers=workers, pin_memory=False, persistent_workers=False)
 
-# 5. Function to evaluate a model: returns accuracy and latency
-def evaluate_model(model, loader):
-    model.eval()
-    correct = 0
-    total = 0
+@torch.no_grad()
+def eval_top1_latency(model, loader, warmup=20, limit=None, device=torch.device("cpu")):
+    model.eval().to(device)
+    total = correct = 0
+    n_seen = 0
+
+    # warmup (don’t time)
+    it = iter(loader)
+    for _ in range(min(warmup, len(loader))):
+        try:
+            x, y = next(it)
+            _ = model(x.to(device))
+        except StopIteration:
+            break
+
+    # timed pass
     start = time.time()
-    with torch.no_grad():
-        for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+    for x, y in loader:
+        x = x.to(device); y = y.to(device)
+        logits = model(x)
+        pred = logits.argmax(1)
+        correct += (pred==y).sum().item()
+        total += y.numel()
+        n_seen += y.numel()
+        if limit is not None and n_seen >= limit:
+            break
     elapsed = time.time() - start
-    accuracy = correct / total
-    # compute latency per sample (or per batch)
-    avg_latency = (elapsed / total) * 1000  # in milliseconds per image
-    return accuracy, avg_latency, elapsed
+    acc = correct/total if total else 0.0
+    ms_per_image = (elapsed / (n_seen if n_seen else 1)) * 1000.0
+    return acc, ms_per_image
 
-# 6. Evaluate each model
-baseline_acc, baseline_latency, base_time = evaluate_model(baseline_model, test_loader)
-ptq_acc, ptq_latency, ptq_time = evaluate_model(ptq_model, test_loader)
-qat_acc, qat_latency, qat_time = evaluate_model(qat_model, test_loader)
+# ---------- quant-safe QAT model (matches your QAT script) ----------
+class QuantBasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride=1, downsample=None, norm_layer=None):
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        self.conv1 = nn.Conv2d(inplanes, planes, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(planes, planes, 3, stride=1, padding=1, bias=False)
+        self.bn2 = norm_layer(planes)
+        self.downsample = downsample
+        self.skip_add = nn.quantized.FloatFunctional()
+    def fuse_model(self):
+        tq.fuse_modules(self, ["conv1","bn1","relu"], inplace=True)
+        tq.fuse_modules(self, ["conv2","bn2"], inplace=True)
+    def forward(self, x):
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out = self.skip_add.add(out, identity)
+        return self.relu(out)
 
-# 7. Get model sizes from disk
-baseline_size = os.path.getsize("../models/resnet18_baseline.pth") / 1e6
-ptq_size = os.path.getsize("../models/resnet18_quantized_ptq.pth") / 1e6
-qat_size = os.path.getsize("../models/resnet18_quantized_qat.pth") / 1e6
+def _make_layer(inplanes, planes, blocks, stride=1, norm_layer=nn.BatchNorm2d):
+    downsample = None
+    if stride != 1 or inplanes != planes * QuantBasicBlock.expansion:
+        downsample = nn.Sequential(
+            nn.Conv2d(inplanes, planes * QuantBasicBlock.expansion, kernel_size=1, stride=stride, bias=False),
+            norm_layer(planes * QuantBasicBlock.expansion),
+        )
+    layers = [QuantBasicBlock(inplanes, planes, stride, downsample, norm_layer)]
+    inplanes = planes * QuantBasicBlock.expansion
+    for _ in range(1, blocks):
+        layers.append(QuantBasicBlock(inplanes, planes, norm_layer=norm_layer))
+    return nn.Sequential(*layers), inplanes
 
-# 8. Print comparison table
-print("\nComparison of ResNet18 models (CIFAR-10):")
-print("Model\t\tAccuracy\tLatency (ms/img)\tSize (MB)")
-print(f"Baseline FP32\t{baseline_acc*100:.2f}%\t\t{baseline_latency:.2f}\t\t{baseline_size:.1f}")
-print(f"PTQ INT8   \t{ptq_acc*100:.2f}%\t\t{ptq_latency:.2f}\t\t{ptq_size:.1f}")
-print(f"QAT INT8   \t{qat_acc*100:.2f}%\t\t{qat_latency:.2f}\t\t{qat_size:.1f}")
+class QuantizableResNet18(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        norm = nn.BatchNorm2d
+        inplanes = 64
+        self.conv1 = nn.Conv2d(3, inplanes, 7, stride=2, padding=3, bias=False)
+        self.bn1 = norm(inplanes); self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
+        self.layer1, inplanes = _make_layer(inplanes, 64,  2, stride=1, norm_layer=norm)
+        self.layer2, inplanes = _make_layer(inplanes, 128, 2, stride=2, norm_layer=norm)
+        self.layer3, inplanes = _make_layer(inplanes, 256, 2, stride=2, norm_layer=norm)
+        self.layer4, inplanes = _make_layer(inplanes, 512, 2, stride=2, norm_layer=norm)
+        self.avgpool = nn.AdaptiveAvgPool2d((1,1))
+        self.fc = nn.Linear(512*QuantBasicBlock.expansion, num_classes)
+        self.quant = tq.QuantStub(); self.dequant = tq.DeQuantStub()
+    def fuse_model(self):
+        tq.fuse_modules(self, ["conv1","bn1","relu"], inplace=True)
+        for layer_name in ["layer1","layer2","layer3","layer4"]:
+            for b in getattr(self, layer_name):
+                b.fuse_model()
+    def forward(self, x):
+        x = self.quant(x)
+        x = self.relu(self.bn1(self.conv1(x))); x = self.maxpool(x)
+        x = self.layer1(x); x = self.layer2(x); x = self.layer3(x); x = self.layer4(x)
+        x = self.avgpool(x); x = torch.flatten(x, 1); x = self.fc(x)
+        x = self.dequant(x)
+        return x
+
+# ---------- helpers to (re)build models ----------
+def build_baseline():
+    m = models.resnet18(weights=None)
+    m.fc = nn.Linear(m.fc.in_features, 10)
+    return m
+
+def build_ptq_quantized_model():
+    # Build a quantizable ResNet18 shape, convert to INT8 modules, then load your saved INT8 weights.
+    qmodel = models.quantization.resnet18(weights=None, num_classes=10, quantize=False)
+    qmodel.eval()                       # fuse requires eval mode
+    qmodel.fuse_model()
+    qmodel.qconfig = tq.get_default_qconfig("fbgemm")
+    tq.prepare(qmodel, inplace=True)    # (Observer warning is fine; we load real INT8 params next.)
+    # Optional: touch observers once to silence the warning:
+    # with torch.no_grad():
+    #     qmodel(torch.randn(1,3,224,224))
+    qmodel = tq.convert(qmodel, inplace=False)
+    qmodel.eval()
+    return qmodel
+
+
+def build_qat_quantized_model():
+    m = QuantizableResNet18(num_classes=10)
+    m.eval()
+    m.fuse_model()                      # fuse in eval
+    m.train()                           # QAT prepare requires TRAIN mode
+    m.qconfig = tq.get_default_qat_qconfig("fbgemm")   # <<< IMPORTANT
+    tq.prepare_qat(m, inplace=True)
+    m = tq.convert(m, inplace=False)    # now swap in quantized ops so the INT8 state_dict matches
+    m.eval()
+    return m
+
+
+
+# ---------- main ----------
+def main():
+    if BASELINE is None:
+        raise FileNotFoundError("Baseline model not found in models/ or outputs/baselines/. Train it first.")
+
+    print("Models:")
+    print("  FP32 baseline:", BASELINE)
+    print("  PTQ INT8     :", PTQ_INT8 if PTQ_INT8 else "(missing)")
+    print("  QAT INT8     :", QAT_INT8 if QAT_INT8 else "(missing)")
+
+    loader = make_loader(batch_size=256)
+    device = torch.device("cpu")  # compare on CPU fairly
+
+    results = []
+
+    # --- Baseline FP32 ---
+    baseline = build_baseline()
+    baseline.load_state_dict(torch.load(BASELINE, map_location="cpu"))
+    size_mb = os.path.getsize(BASELINE)/1e6
+    acc, ms = eval_top1_latency(baseline, loader, warmup=10, device=device)
+    results.append({"name":"fp32_baseline","acc":round(acc*100,2),"ms_per_img":round(ms,3),"size_mb":round(size_mb,2)})
+
+    # --- PTQ INT8 (if present) ---
+    if PTQ_INT8 is not None:
+        ptq = build_ptq_quantized_model()
+        # load INT8 state dict (already converted)
+        state = torch.load(PTQ_INT8, map_location="cpu")
+        missing, unexpected = ptq.load_state_dict(state, strict=False)
+        if missing:   print("[ptq warn] missing keys:", missing)
+        if unexpected:print("[ptq warn] unexpected keys:", unexpected)
+        size_mb = os.path.getsize(PTQ_INT8)/1e6
+        try:
+            acc, ms = eval_top1_latency(ptq, loader, warmup=10, device=device)
+            results.append({"name":"ptq_int8","acc":round(acc*100,2),"ms_per_img":round(ms,3),"size_mb":round(size_mb,2)})
+        except NotImplementedError:
+            print("[ptq warn] backend missing some quantized op; skipping accuracy. Reporting size only.")
+            results.append({"name":"ptq_int8","acc":None,"ms_per_img":None,"size_mb":round(size_mb,2)})
+    else:
+        print("[info] PTQ model not found; skipping.")
+
+    # --- QAT INT8 (if present) ---
+    if QAT_INT8 is not None:
+        qat = build_qat_quantized_model()
+        state = torch.load(QAT_INT8, map_location="cpu")
+        missing, unexpected = qat.load_state_dict(state, strict=False)
+        if missing:   print("[qat warn] missing keys:", missing)
+        if unexpected:print("[qat warn] unexpected keys:", unexpected)
+        size_mb = os.path.getsize(QAT_INT8)/1e6
+        try:
+            acc, ms = eval_top1_latency(qat, loader, warmup=10, device=device)
+            results.append({"name":"qat_int8","acc":round(acc*100,2),"ms_per_img":round(ms,3),"size_mb":round(size_mb,2)})
+        except NotImplementedError:
+            print("[qat warn] backend missing some quantized op; skipping accuracy. Reporting size only.")
+            results.append({"name":"qat_int8","acc":None,"ms_per_img":None,"size_mb":round(size_mb,2)})
+    else:
+        print("[info] QAT model not found; skipping.")
+
+    # print table
+    print("\n=== CIFAR-10 Evaluation (CPU) ===")
+    for r in results:
+        print(f"{r['name']:>12}  acc={str(r['acc']).rjust(6)}  ms/img={str(r['ms_per_img']).rjust(7)}  sizeMB={r['size_mb']:>6}")
+
+    with open(OUT / "cifar10_eval.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print("Wrote ->", OUT / "cifar10_eval.json")
+
+if __name__ == "__main__":
+    main()
