@@ -21,7 +21,7 @@ from eval.report import log_experiment, write_json, write_csv_row, add_timestamp
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CIFAR_PATH = "outputs/baselines/resnet18_cifar10.pt"
-SST2_PATH = "outputs/baselines/distilbert_sst2"
+SST2_PATH = "models/distilbert_baseline"
 
 st.set_page_config(page_title="Quanteval Demo", layout="wide")
 
@@ -183,10 +183,49 @@ if st.button("Run evaluation"):
             ds = ds.select(range(min(len(ds), eval_samples)))
             loader = DataLoader(ds, batch_size=16)
             # evaluate accuracy (use top1 utility expects model returning logits)
-            acc = top1(model, loader, device=device)
+            # acc = top1(model, loader, device=device)
+            model.eval()
+            correct = 0
+            total = 0
+
+            for batch in loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["label"].to(device)
+
+                with torch.no_grad():
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    preds = torch.argmax(outputs.logits, dim=-1)
+
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+
+            acc = correct / total
             # latency (create example batch)
             example_batch = next(iter(DataLoader(ds, batch_size=1)))
-            latency_s = measure_latency_s(model, example_batch, runs=int(latency_runs), warmup=int(latency_warmup), device=str(device.type))
+            # latency_s = measure_latency_s(model, example_batch, runs=int(latency_runs), warmup=int(latency_warmup), device=str(device.type))
+            # Determine example input depending on model type
+            if model_type.startswith("resnet"):
+                example_input = example_batch[0].to(device)
+            elif model_type.startswith("distilbert"):
+                example_input = {
+                    "input_ids": example_batch["input_ids"].to(device),
+                    "attention_mask": example_batch["attention_mask"].to(device)
+                }
+            else:
+                st.error("Unknown model type for latency measurement")
+                example_input = None
+
+            if example_input is not None:
+                latency_s = measure_latency_s(
+                    model,
+                    example_input,
+                    runs=int(latency_runs),
+                    warmup=int(latency_warmup),
+                    device=str(device.type)
+                )
+            else:
+                latency_s = 0.0
             param_mb = param_bytes(model) / 1e6
             metrics = {"accuracy": float(acc), "latency_s": float(latency_s), "param_MB": float(param_mb), "peak_mem_MB": 0.0}
         else:
