@@ -1,79 +1,129 @@
 # scripts/quantize_sst2_dynamic.py
-# Dynamic Quantization of a fine-tuned DistilBERT model on SST-2 using PyTorch.
-# Loads a fine-tuned FP32 model from models/distilbert_baseline
-# Saves quantized INT8 model weights to models/distilbert_quantized_dynamic.pth
+# Dynamic quantization for DistilBERT on GLUE/SST-2 with live progress.# Outputs match project style:
+#   - models/distilbert_quantized_dynamic.pt
+#   - outputs/reports/sst2_dynamic/history.json
+#   - outputs/reports/sst2_dynamic/report.json
+
+
+import os, time, json, math
+os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")  # <- skip torchvision import
+
+from pathlib import Path
 import torch
-from transformers import DistilBertForSequenceClassification
-
-import time, os
-
-# 1. Load the fine-tuned DistilBERT base model (FP32)
-model_dir = "../models/distilbert_baseline"
-model = DistilBertForSequenceClassification.from_pretrained(model_dir)
-model.eval()
-print("Loaded DistilBERT baseline model (FP32).")
-
-# 2. Apply dynamic quantization on linear layers to get an INT8 model
-quantized_model = torch.quantization.quantize_dynamic(
-    model, 
-    {torch.nn.Linear},  # specify which modules to quantize (Linear layers to int8)
-    dtype=torch.qint8
-)
-print("Applied dynamic quantization to DistilBERT (INT8 weights for Linear layers).")
-
-# 3. Evaluate the quantized model on SST-2 validation set
-# Load SST-2 validation data and tokenizer
 from datasets import load_dataset
-from transformers import DistilBertTokenizerFast
-datasets = load_dataset('glue', 'sst2')
-val_dataset = datasets['validation']
-tokenizer = DistilBertTokenizerFast.from_pretrained(model_dir)
-
-# Tokenize the validation set
-val_enc = val_dataset.map(lambda examples: tokenizer(examples['sentence'], truncation=True, padding=True, max_length=128), batched=True)
-val_enc.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
-
-# Create DataLoader for evaluation
+from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
 from torch.utils.data import DataLoader
-val_loader = DataLoader(val_enc, batch_size=32, shuffle=False)
+from tqdm import tqdm
 
-# Measure accuracy and inference time
-correct = 0
-total = 0
-start_time = time.time()
-with torch.no_grad():
-    for batch in val_loader:
-        input_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
-        labels = batch['label']
-        # Ensure model is on CPU (dynamic quant is CPU-only by default)
-        outputs = quantized_model(input_ids, attention_mask=attention_mask)
-        # outputs.logits is the classification head output
-        logits = outputs.logits
-        predictions = torch.argmax(logits, dim=1)
-        total += labels.size(0)
-        correct += (predictions == labels).sum().item()
-elapsed = time.time() - start_time
-accuracy = correct / total
-print(f"Dynamic INT8 DistilBERT Accuracy: {accuracy*100:.2f}% (vs FP32 baseline).")
-print(f"Inference time on CPU for {total} sentences: {elapsed:.2f} seconds.")
+def set_repro(seed=42):
+    import random, numpy as np
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.set_num_threads(min(8, os.cpu_count() or 1))
 
-# 4. Save the quantized model weights (state dict)
-save_path = "../models/distilbert_quantized_dynamic.pth"
-torch.save(quantized_model.state_dict(), save_path)
-print(f"Saved dynamic quantized model state to {save_path}")
+ROOT = Path(__file__).resolve().parents[1]
+BASELINE_DIR = ROOT / "models" / "distilbert_baseline"
+REPORT_DIR   = ROOT / "outputs" / "reports" / "sst2_dynamic"
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+MODELS_DIR   = ROOT / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-# 5. Report model size reduction
-fp32_model_path = os.path.join(model_dir, "pytorch_model.bin")
-if os.path.exists(fp32_model_path):
-    fp32_size = os.path.getsize(fp32_model_path) / 1e6
-    int8_size = os.path.getsize(save_path) / 1e6
-    print(f"FP32 model size: {fp32_size:.2f} MB, INT8 model size: {int8_size:.2f} MB")
-else:
-    # If for some reason the model was saved differently, compute in-memory size
-    torch.save(model.state_dict(), "temp_fp32.pth")
-    torch.save(quantized_model.state_dict(), "temp_int8.pth")
-    fp32_size = os.path.getsize("temp_fp32.pth")/1e6
-    int8_size = os.path.getsize("temp_int8.pth")/1e6
-    os.remove("temp_fp32.pth"); os.remove("temp_int8.pth")
-    print(f"FP32 model size (state_dict): {fp32_size:.2f} MB, INT8 model size: {int8_size:.2f} MB")
+SAVE_WEIGHTS = MODELS_DIR / "distilbert_dynamic_int8.pt"
+HISTORY_JSON = REPORT_DIR / "history.json"
+REPORT_JSON  = REPORT_DIR / "report.json"
+
+def collate(tokenizer):
+    def _fn(batch):
+        enc = tokenizer([ex["sentence"] for ex in batch], truncation=True, padding=True, return_tensors="pt")
+        enc["labels"] = torch.tensor([ex["label"] for ex in batch], dtype=torch.long)
+        return enc
+    return _fn
+
+@torch.no_grad()
+def evaluate(model, loader, device, print_every=50):
+    model.eval().to(device)
+    total = 0
+    correct = 0
+    t0 = time.time()
+    running = []
+    pbar = tqdm(total=len(loader), desc="Eval (INT8)", ncols=80)
+    for i, batch in enumerate(loader, 1):
+        batch = {k: v.to(device) for k, v in batch.items()}
+        logits = model(**{k: batch[k] for k in ("input_ids","attention_mask")}).logits
+        preds = logits.argmax(-1)
+        correct += (preds == batch["labels"]).sum().item()
+        total += batch["labels"].numel()
+        acc = correct / max(total, 1)
+        running.append({"step": i, "running_acc": acc, "seen": total, "elapsed_s": time.time()-t0})
+        if i % print_every == 0:
+            print(f"[eval] step {i:5d}/{len(loader)} | running_acc={acc*100:5.2f}% | seen={total}")
+        pbar.update(1)
+    pbar.close()
+    with open(HISTORY_JSON, "w") as f:
+        json.dump(running, f, indent=2)
+    return correct / max(total, 1), time.time() - t0
+
+def main():
+    set_repro(42)
+    device = torch.device("cpu")  # dynamic quant runs on CPU
+    print(f"Device: {device}")
+
+    # 1) Load baseline FP32 model + tokenizer
+    if not BASELINE_DIR.exists():
+        raise FileNotFoundError(f"Baseline not found at {BASELINE_DIR}. Run train_sst2.py first.")
+    print("Loading tokenizer/model from:", BASELINE_DIR)
+    tokenizer = DistilBertTokenizerFast.from_pretrained(str(BASELINE_DIR))
+    fp32 = DistilBertForSequenceClassification.from_pretrained(str(BASELINE_DIR)).to(device).eval()
+
+    # 2) Load SST-2 validation for evaluation
+    print("Loading GLUE/SST-2 (validation)…")
+    ds = load_dataset("glue", "sst2", split="validation")
+    loader = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate(tokenizer))
+
+    # 3) Evaluate FP32 baseline
+    print("Evaluating FP32 baseline…")
+    fp32_acc, fp32_time = evaluate(fp32, loader, device, print_every=50)
+    print(f"FP32  val_acc={fp32_acc*100:.2f}% | time={fp32_time:.2f}s")
+
+    # 4) Dynamic quantization (Linear layers -> int8)
+    print("Applying dynamic quantization (nn.Linear->int8)…")
+    qmodel = torch.quantization.quantize_dynamic(
+        fp32.cpu(), {torch.nn.Linear}, dtype=torch.qint8
+    ).to(device).eval()
+
+    # 5) Evaluate INT8
+    print("Evaluating INT8 quantized model…")
+    int8_acc, int8_time = evaluate(qmodel, loader, device, print_every=50)
+    print(f"INT8  val_acc={int8_acc*100:.2f}% | time={int8_time:.2f}s")
+
+    # 6) Save quantized weights
+    torch.save(qmodel.state_dict(), SAVE_WEIGHTS)
+    print(f"Saved INT8 state_dict -> {SAVE_WEIGHTS}")
+
+    # 7) Report
+    report = {
+        "task": "sst2",
+        "model": "distilbert-base-uncased",
+        "method": "dynamic_int8",
+        "paths": {
+            "baseline_dir": str(BASELINE_DIR),
+            "int8_state_dict": str(SAVE_WEIGHTS),
+            "history_json": str(HISTORY_JSON),
+            "report_json": str(REPORT_JSON),
+        },
+        "metrics": {
+            "fp32": {"val_acc": round(float(fp32_acc), 4), "eval_time_s": round(float(fp32_time), 2)},
+            "int8": {"val_acc": round(float(int8_acc), 4), "eval_time_s": round(float(int8_time), 2)},
+        },
+        "env": {
+            "device": str(device),
+            "torch": torch.__version__,
+        },
+    }
+    with open(REPORT_JSON, "w") as f:
+        json.dump(report, f, indent=2)
+    print("Wrote report ->", REPORT_JSON)
+
+if __name__ == "__main__":
+    main()
