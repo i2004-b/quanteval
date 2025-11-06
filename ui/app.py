@@ -9,7 +9,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import sys, os
 from torchvision.models import resnet18
-from transformers import DistilBertForSequenceClassification
+from transformers import DistilBertForSequenceClassification, DistilBertTokenizer
 import pandas as pd
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -20,8 +20,8 @@ from eval.memory import param_bytes, on_disk_bytes_state_dict, peak_gpu_mem_once
 from eval.report import log_experiment, write_json, write_csv_row, add_timestamp, read_results
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CIFAR_PATH = "outputs/baselines/resnet18_cifar10.pt"
-SST2_PATH = "models/distilbert_baseline"
+CIFAR_PATH = "models/resnet18_baseline.pt"
+SST2_PATH = "models/distilbert_baseline.pt"
 
 st.set_page_config(page_title="Quanteval Demo", layout="wide")
 
@@ -138,7 +138,17 @@ if st.button("Run evaluation"):
                 model_loaded = True
                 
             elif model_type.startswith("distilbert"):
-                model = DistilBertForSequenceClassification.from_pretrained(SST2_PATH, local_files_only=True)
+                # model = DistilBertForSequenceClassification.from_pretrained(SST2_PATH, local_files_only=True)
+                # Use the official Hugging Face fine-tuned DistilBERT for SST-2
+                MODEL_NAME = "distilbert-base-uncased-finetuned-sst-2-english"
+
+                # Load model and tokenizer
+                try:
+                    tokenizer = DistilBertTokenizer.from_pretrained(MODEL_NAME)
+                    model = DistilBertForSequenceClassification.from_pretrained(MODEL_NAME)
+                    st.success("✅ DistilBERT baseline model loaded successfully.")
+                except Exception as e:
+                    st.error(f"❌ Failed to load DistilBERT model: {e}")
                 model_loaded = True
                 
             else:

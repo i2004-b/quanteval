@@ -1,30 +1,32 @@
 import time, torch
 @torch.no_grad()
-def measure_latency_s(model, example_batch, runs=30, warmup=5, device="cpu"):
-    
+def measure_latency_s(model, example_batch, runs=10, warmup=2, device="cpu"):
+    """
+    Measures average latency (in seconds) of a single forward pass.
+    Works for both image tensors and text token dictionaries.
+    """
     model.eval()
-    model.to(device)
 
-    # Handle different batch types
-    if isinstance(example_batch, (list, tuple)):
-        xb = example_batch[0].to(device)
-    elif isinstance(example_batch, dict):
-        xb = {k: v.to(device) for k, v in example_batch.items() if torch.is_tensor(v)}
+    # Move example to device
+    if isinstance(example_batch, dict):
+        # NLP models (e.g., DistilBERT)
+        example_batch = {k: v.to(device) for k, v in example_batch.items()}
+    elif isinstance(example_batch, (list, tuple)):
+        # Just take the first tensor in case it's a list
+        example_batch = example_batch[0].to(device)
     else:
-        raise TypeError(f"Unsupported example batch type: {type(example_batch)}")
+        # Normal tensor
+        example_batch = example_batch.to(device)
 
-    # Warm-up (to stabilize GPU timing)
+    # Warmup
     for _ in range(warmup):
-        _ = model(xb)
+        _ = model(**example_batch) if isinstance(example_batch, dict) else model(example_batch)
 
     # Timed runs
-    torch.cuda.synchronize() if device == "cuda" else None
     start = time.perf_counter()
-
     for _ in range(runs):
-        _ = model(xb)
-    torch.cuda.synchronize() if device == "cuda" else None
+        _ = model(**example_batch) if isinstance(example_batch, dict) else model(example_batch)
+    end = time.perf_counter()
 
-    total = time.perf_counter() - start
-    avg_latency = total / runs
-    return avg_latency
+    latency = (end - start) / runs
+    return latency
