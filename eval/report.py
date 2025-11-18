@@ -18,7 +18,7 @@ def add_timestamp(d):
     d["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
     return d
 
-def log_experiment(metrics, model_name, dataset, method, out_dir="outputs/reports"):
+def log_experiment(metrics, model_name, method, out_dir="outputs/reports"):
     """
     metrics: dict of metric_name -> value
     model_name: str ("ResNet18" / "DistilBERT")
@@ -30,14 +30,13 @@ def log_experiment(metrics, model_name, dataset, method, out_dir="outputs/report
     # add metadata + timestamp
     record = {
         "model": model_name,
-        "dataset": dataset,
         "method": method,
         **metrics
     }
     record = add_timestamp(record)
 
     # save JSON (per run)
-    json_path = os.path.join(out_dir, f"{model_name}_{dataset}_{method}.json")
+    json_path = os.path.join(out_dir, f"{model_name}_{method}.json")
     write_json(record, json_path)
 
     # append CSV row (all runs)

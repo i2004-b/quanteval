@@ -96,7 +96,12 @@ def main():
     tokenizer = DistilBertTokenizerFast.from_pretrained(model_name)
 
     def preprocess(batch):
-        enc = tokenizer(batch["sentence"], truncation=True)
+        enc = tokenizer(
+            batch["sentence"],
+            truncation=True,
+            padding="max_length",
+            max_length=128,
+        )
         # HF models expect 'labels'
         enc["labels"] = batch["label"]
         return enc
@@ -106,7 +111,10 @@ def main():
     # First map: create tokenized inputs + labels
     ds_enc = ds.map(preprocess, batched=True, remove_columns=remove_cols)
     # Second map: now drop the original 'sentence' and 'label' (we have 'labels' already)
-    ds_enc = ds_enc.remove_columns(["sentence", "label"])
+    # Keep input_ids, attention_mask, labels only
+    ds_enc = ds_enc.remove_columns(
+        [c for c in ds_enc["train"].column_names if c not in ["input_ids", "attention_mask", "labels"]]
+    )
 
     # 3) Model
     model = DistilBertForSequenceClassification.from_pretrained(model_name, num_labels=2)
