@@ -2,6 +2,14 @@
 import os
 import torch
 from transformers import DistilBertForSequenceClassification
+import torchvision.models as models
+
+# Get project root directory (parent of ui/)
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+def _get_project_path(relative_path):
+    """Convert relative path to absolute path based on project root."""
+    return os.path.join(_PROJECT_ROOT, relative_path)
 
 
 ###############################################################################
@@ -10,38 +18,299 @@ from transformers import DistilBertForSequenceClassification
 
 def load_hf_model(model_dir, device):
     """Loads an entire HuggingFace folder."""
+    # Convert to absolute path if relative
+    if not os.path.isabs(model_dir):
+        model_dir = _get_project_path(model_dir)
+    if not os.path.exists(model_dir):
+        raise FileNotFoundError(f"HuggingFace model directory not found: {model_dir}")
     model = DistilBertForSequenceClassification.from_pretrained(model_dir)
     model.to(device)
     model.eval()
     return model
 
+def load_resnet18_state_dict(path, device, num_classes=10):
+    """
+    Load ResNet18 state dict for CIFAR-10 (10 classes).
+    num_classes: number of output classes (default 10 for CIFAR-10)
+    """
+    import torch.nn as nn
+    # Convert to absolute path if relative
+    if not os.path.isabs(path):
+        path = _get_project_path(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"ResNet18 model file not found: {path}")
+    model = models.resnet18(weights=None)  # no pretrained weights
+    # Modify final layer for CIFAR-10 (10 classes instead of 1000)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    state_dict = torch.load(path, map_location="cpu")
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
 
-def load_state_dict_model(baseline_dir, state_dict_path, device):
-    """Loads a model architecture from baseline_dir and applies a state_dict."""
+
+def load_resnet18_ptq_quantized(path, device, num_classes=10):
+    """
+    Load PTQ (Post-Training Quantization) quantized ResNet18 model.
+    This model uses torchvision's quantization-aware architecture.
+    """
+    try:
+        import torch.ao.quantization as tq
+    except ImportError:
+        import torch.quantization as tq
+    import torchvision.models.quantization as qmodels
+    # Convert to absolute path if relative
+    if not os.path.isabs(path):
+        path = _get_project_path(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"PTQ quantized model file not found: {path}")
+    
+    # Build quantized model architecture
+    qmodel = qmodels.resnet18(weights=None, num_classes=num_classes, quantize=False)
+    qmodel.eval()  # fuse requires eval mode
+    qmodel.fuse_model()
+    qmodel.qconfig = tq.get_default_qconfig("fbgemm")
+    tq.prepare(qmodel, inplace=True)
+    qmodel = tq.convert(qmodel, inplace=False)
+    qmodel.eval()
+    
+    # Load the quantized state dict
+    state_dict = torch.load(path, map_location="cpu")
+    qmodel.load_state_dict(state_dict)
+    qmodel.to(device)
+    qmodel.eval()
+    return qmodel
+
+
+# QAT requires a custom QuantizableResNet18 architecture
+def _make_qat_layer(inplanes, planes, blocks, stride=1, norm_layer=None):
+    """Helper to create a layer of QuantBasicBlock for QAT."""
+    import torch.nn as nn
+    try:
+        import torch.ao.quantization as tq
+    except ImportError:
+        import torch.quantization as tq
+    if norm_layer is None:
+        norm_layer = nn.BatchNorm2d
+    
+    downsample = None
+    if stride != 1 or inplanes != planes:
+        downsample = nn.Sequential(
+            nn.Conv2d(inplanes, planes, kernel_size=1, stride=stride, bias=False),
+            norm_layer(planes),
+        )
+    
+    layers = []
+    layers.append(_QuantBasicBlock(inplanes, planes, stride, downsample, norm_layer))
+    inplanes = planes
+    for _ in range(1, blocks):
+        layers.append(_QuantBasicBlock(inplanes, planes, norm_layer=norm_layer))
+    return nn.Sequential(*layers), inplanes
+
+
+class _QuantBasicBlock(torch.nn.Module):
+    """Basic block for quantizable ResNet18 (used in QAT)."""
+    expansion = 1
+    
+    def __init__(self, inplanes, planes, stride=1, downsample=None, norm_layer=None):
+        super().__init__()
+        import torch.nn as nn
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        self.conv1 = nn.Conv2d(inplanes, planes, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(planes, planes, 3, stride=1, padding=1, bias=False)
+        self.bn2 = norm_layer(planes)
+        self.downsample = downsample
+        self.skip_add = nn.quantized.FloatFunctional()
+    
+    def fuse_model(self):
+        try:
+            import torch.ao.quantization as tq
+        except ImportError:
+            import torch.quantization as tq
+        tq.fuse_modules(self, ["conv1", "bn1", "relu"], inplace=True)
+        tq.fuse_modules(self, ["conv2", "bn2"], inplace=True)
+    
+    def forward(self, x):
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out = self.skip_add.add(out, identity)
+        return self.relu(out)
+
+
+class _QuantizableResNet18(torch.nn.Module):
+    """Custom quantizable ResNet18 for QAT (matches training script)."""
+    
+    def __init__(self, num_classes=10):
+        super().__init__()
+        import torch.nn as nn
+        try:
+            import torch.ao.quantization as tq
+        except ImportError:
+            import torch.quantization as tq
+        norm = nn.BatchNorm2d
+        inplanes = 64
+        self.conv1 = nn.Conv2d(3, inplanes, 7, stride=2, padding=3, bias=False)
+        self.bn1 = norm(inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
+        self.layer1, inplanes = _make_qat_layer(inplanes, 64, 2, stride=1, norm_layer=norm)
+        self.layer2, inplanes = _make_qat_layer(inplanes, 128, 2, stride=2, norm_layer=norm)
+        self.layer3, inplanes = _make_qat_layer(inplanes, 256, 2, stride=2, norm_layer=norm)
+        self.layer4, inplanes = _make_qat_layer(inplanes, 512, 2, stride=2, norm_layer=norm)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * _QuantBasicBlock.expansion, num_classes)
+        self.quant = tq.QuantStub()
+        self.dequant = tq.DeQuantStub()
+    
+    def fuse_model(self):
+        try:
+            import torch.ao.quantization as tq
+        except ImportError:
+            import torch.quantization as tq
+        tq.fuse_modules(self, ["conv1", "bn1", "relu"], inplace=True)
+        for layer_name in ["layer1", "layer2", "layer3", "layer4"]:
+            for b in getattr(self, layer_name):
+                b.fuse_model()
+    
+    def forward(self, x):
+        x = self.quant(x)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        x = self.dequant(x)
+        return x
+
+
+def load_resnet18_qat_quantized(path, device, num_classes=10):
+    """
+    Load QAT (Quantization-Aware Training) quantized ResNet18 model.
+    This uses a custom QuantizableResNet18 architecture.
+    """
+    try:
+        import torch.ao.quantization as tq
+    except ImportError:
+        import torch.quantization as tq
+    
+    # Convert to absolute path if relative
+    if not os.path.isabs(path):
+        path = _get_project_path(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"QAT quantized model file not found: {path}")
+    
+    # Build the custom QuantizableResNet18 architecture
+    qmodel = _QuantizableResNet18(num_classes=num_classes)
+    qmodel.eval()
+    qmodel.fuse_model()  # Fuse in eval mode
+    qmodel.train()  # QAT prepare requires TRAIN mode
+    qmodel.qconfig = tq.get_default_qat_qconfig("fbgemm")
+    tq.prepare_qat(qmodel, inplace=True)
+    qmodel = tq.convert(qmodel, inplace=False)  # Convert to quantized ops
+    qmodel.eval()
+    
+    # Load the quantized state dict
+    state_dict = torch.load(path, map_location="cpu")
+    missing, unexpected = qmodel.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"[QAT warn] Missing keys (first 5): {list(missing)[:5]}")
+    if unexpected:
+        print(f"[QAT warn] Unexpected keys (first 5): {list(unexpected)[:5]}")
+    
+    qmodel.to(device)
+    qmodel.eval()
+    return qmodel
+
+
+def load_state_dict_model(baseline_dir, state_dict_path, device, is_dynamic_quantized=False):
+    """
+    Loads a model architecture from baseline_dir and applies a state_dict.
+    is_dynamic_quantized: If True, applies dynamic quantization before loading state_dict.
+    """
+    # Convert to absolute paths if relative
+    if not os.path.isabs(baseline_dir):
+        baseline_dir = _get_project_path(baseline_dir)
+    if not os.path.isabs(state_dict_path):
+        state_dict_path = _get_project_path(state_dict_path)
+    
+    if not os.path.exists(baseline_dir):
+        raise FileNotFoundError(f"Baseline model directory not found: {baseline_dir}")
+    if not os.path.exists(state_dict_path):
+        raise FileNotFoundError(f"State dict file not found: {state_dict_path}")
+    
     print("Loading baseline architecture:", baseline_dir)
     model = DistilBertForSequenceClassification.from_pretrained(baseline_dir)
-
+    
+    # For dynamic quantized models, we need to apply quantization first
+    # This converts Linear layers to DynamicQuantizedLinear
+    if is_dynamic_quantized:
+        try:
+            import torch.ao.quantization as tq
+        except ImportError:
+            import torch.quantization as tq
+        print("Applying dynamic quantization before loading state_dict...")
+        model = tq.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+    
     print("Loading state_dict:", state_dict_path)
     state_dict = torch.load(state_dict_path, map_location="cpu")
-    model.load_state_dict(state_dict)
+    
+    # Load with strict=False for quantized models to handle any mismatches
+    missing, unexpected = model.load_state_dict(state_dict, strict=not is_dynamic_quantized)
+    if is_dynamic_quantized:
+        if missing:
+            print(f"[Dynamic quant warn] Missing keys (first 5): {list(missing)[:5]}")
+        if unexpected:
+            print(f"[Dynamic quant warn] Unexpected keys (first 5): {list(unexpected)[:5]}")
+    elif missing or unexpected:
+        # For non-quantized models, strict loading should work
+        raise RuntimeError(f"Failed to load state_dict. Missing: {missing}, Unexpected: {unexpected}")
 
     model.to(device)
     model.eval()
     return model
 
 
-def load_user_uploaded_model(path, device):
+def load_user_uploaded_model(path, device, model_type=None):
     """
     Smart loader:
     - If directory → treat as HuggingFace model folder
     - If .pt or .bin → treat as a raw state_dict
+    - model_type: "ResNet18" or "DistilBERT" to determine which baseline to use
     """
     if os.path.isdir(path):
         return load_hf_model(path, device)
 
-    if path.endswith(".pt") or path.endswith(".bin"):
-        BASELINE = "models/distilbert_baseline"
-        return load_state_dict_model(BASELINE, path, device)
+    if path.endswith(".pt") or path.endswith(".pth") or path.endswith(".bin"):
+        # Determine which baseline to use based on model_type
+        if model_type == "ResNet18":
+            # For ResNet18, load directly as state_dict
+            return load_resnet18_state_dict(path, device)
+        elif model_type == "DistilBERT":
+            # For DistilBERT, use baseline architecture
+            BASELINE = "models/distilbert_baseline"
+            return load_state_dict_model(BASELINE, path, device)
+        else:
+            # Try to auto-detect: if model_type not provided, default to DistilBERT
+            # but warn the user
+            import warnings
+            warnings.warn(f"Model type not specified for uploaded file. Defaulting to DistilBERT. "
+                         f"Please specify model_type if this is a ResNet18 model.")
+            BASELINE = "models/distilbert_baseline"
+            try:
+                return load_state_dict_model(BASELINE, path, device)
+            except Exception:
+                # If DistilBERT fails, try ResNet18
+                return load_resnet18_state_dict(path, device)
 
     raise ValueError(f"Unsupported user model format: {path}")
 
@@ -59,7 +328,7 @@ MODEL_REGISTRY = {
 
     # ---- Dynamic Quant (INT8) ------------------------------------------------
     "distilbert_dynamic_int8": {
-        "type": "state_dict",
+        "type": "state_dict_dynamic_quant",
         "path": "models/distilbert_dynamic_int8.pt",
         "baseline": "models/distilbert_baseline",
     },
@@ -83,6 +352,22 @@ MODEL_REGISTRY = {
         "type": "user",
         "path": None,
     },
+    
+    # ================================
+    # ResNet18 MODELS
+    # ================================
+    "resnet18_baseline": {
+        "type": "resnet_state_dict",
+        "path": "models/resnet18_baseline.pt",
+    },
+    "resnet18_ptq": {
+        "type": "resnet_ptq_quantized",
+        "path": "models/resnet18_quantized_ptq.pt",
+    },
+    "resnet18_qat": {
+        "type": "resnet_qat_quantized",
+        "path": "models/resnet18_quantized_qat.pt",
+    },
 }
 
 
@@ -90,11 +375,12 @@ MODEL_REGISTRY = {
 # 3) --- MASTER LOADER --------------------------------------------------------
 ###############################################################################
 
-def load_model(model_key, device, user_path=None):
+def load_model(model_key, device, user_path=None, user_model_type=None):
     """
     Unified loader used by your UI.
     model_key = dropdown selection
     user_path = path chosen by user
+    user_model_type = "ResNet18" or "DistilBERT" for user-uploaded models
     """
     cfg = MODEL_REGISTRY.get(model_key)
     if cfg is None:
@@ -106,7 +392,7 @@ def load_model(model_key, device, user_path=None):
     if model_type == "user":
         if not user_path:
             raise ValueError("user_path must be provided for user-uploaded models.")
-        return load_user_uploaded_model(user_path, device)
+        return load_user_uploaded_model(user_path, device, model_type=user_model_type)
 
     # -------------------------- HF DIRECTORY ---------------------------------
     if model_type == "hf_dir":
@@ -116,6 +402,63 @@ def load_model(model_key, device, user_path=None):
     if model_type == "state_dict":
         baseline = cfg["baseline"]
         state_dict = cfg["path"]
-        return load_state_dict_model(baseline, state_dict, device)
+        # Check if files exist before attempting to load
+        state_dict_abs = _get_project_path(state_dict) if not os.path.isabs(state_dict) else state_dict
+        if not os.path.exists(state_dict_abs):
+            raise FileNotFoundError(
+                f"Model file not found: {state_dict}\n"
+                f"Expected at: {state_dict_abs}\n"
+                f"This model variant may not be available yet. Please generate it first or use a different variant."
+            )
+        return load_state_dict_model(baseline, state_dict, device, is_dynamic_quantized=False)
+    
+    # ------------------------- STATE_DICT DYNAMIC QUANTIZED MODEL -------------
+    if model_type == "state_dict_dynamic_quant":
+        baseline = cfg["baseline"]
+        state_dict = cfg["path"]
+        # Check if files exist before attempting to load
+        state_dict_abs = _get_project_path(state_dict) if not os.path.isabs(state_dict) else state_dict
+        if not os.path.exists(state_dict_abs):
+            raise FileNotFoundError(
+                f"Dynamic quantized model file not found: {state_dict}\n"
+                f"Expected at: {state_dict_abs}\n"
+                f"This model variant may not be available yet. Please generate it first or use a different variant."
+            )
+        return load_state_dict_model(baseline, state_dict, device, is_dynamic_quantized=True)
+    
+    if model_type == "resnet_state_dict":
+        # Check if file exists before attempting to load
+        path_abs = _get_project_path(cfg["path"]) if not os.path.isabs(cfg["path"]) else cfg["path"]
+        if not os.path.exists(path_abs):
+            raise FileNotFoundError(
+                f"Model file not found: {cfg['path']}\n"
+                f"Expected at: {path_abs}\n"
+                f"This model variant may not be available yet. Please generate it first or use a different variant."
+            )
+        return load_resnet18_state_dict(cfg["path"], device)
+    
+    # ------------------------- PTQ QUANTIZED MODEL -------------------------------
+    if model_type == "resnet_ptq_quantized":
+        # Check if file exists before attempting to load
+        path_abs = _get_project_path(cfg["path"]) if not os.path.isabs(cfg["path"]) else cfg["path"]
+        if not os.path.exists(path_abs):
+            raise FileNotFoundError(
+                f"PTQ quantized model file not found: {cfg['path']}\n"
+                f"Expected at: {path_abs}\n"
+                f"This model variant may not be available yet. Please generate it first or use a different variant."
+            )
+        return load_resnet18_ptq_quantized(cfg["path"], device)
+    
+    # ------------------------- QAT QUANTIZED MODEL -------------------------------
+    if model_type == "resnet_qat_quantized":
+        # Check if file exists before attempting to load
+        path_abs = _get_project_path(cfg["path"]) if not os.path.isabs(cfg["path"]) else cfg["path"]
+        if not os.path.exists(path_abs):
+            raise FileNotFoundError(
+                f"QAT quantized model file not found: {cfg['path']}\n"
+                f"Expected at: {path_abs}\n"
+                f"This model variant may not be available yet. Please generate it first or use a different variant."
+            )
+        return load_resnet18_qat_quantized(cfg["path"], device)
 
     raise ValueError(f"Unsupported model type: {model_type}")
