@@ -151,7 +151,7 @@ def evaluate_cifar10_model(model, eval_samples, latency_runs, latency_warmup, de
         device=str(device.type),
     )
 
-    peak_mem = peak_gpu_mem_once(model, imgs) if device.type == "cuda" else 0
+    # peak_mem = peak_gpu_mem_once(model, imgs) if device.type == "cuda" else 0
     param_mb = param_bytes(model) / 1e6
 
     return {
@@ -159,7 +159,6 @@ def evaluate_cifar10_model(model, eval_samples, latency_runs, latency_warmup, de
         "Latency (s)": float(latency_s),
         "Latency (ms)": float(latency_s * 1000),
         "param_MB": float(param_mb),
-        "peak_memory_MB": float(peak_mem)/1e6 if peak_mem else 0.0
     }
 
 
@@ -207,7 +206,6 @@ def evaluate_sst2_model(model, eval_samples, latency_runs, latency_warmup, devic
         "Latency (s)": float(latency_s),
         "Latency (ms)": float(latency_s * 1000),
         "param_MB": float(param_mb),
-        "peak_mem_MB": 0.0,
     }
 
 
@@ -295,26 +293,7 @@ def create_metrics_charts(metrics, model_name="Model"):
         charts_created.append(fig_size)
     
     # Memory chart
-    mem_metrics = {k: v for k, v in metrics.items() if ("memory" in k.lower() or "mem" in k.lower()) and "MB" in k}
-    if mem_metrics and any(v > 0 for v in mem_metrics.values()):
-        mem_keys = list(mem_metrics.keys())
-        mem_values = [mem_metrics[k] for k in mem_keys]
-        fig_mem = go.Figure()
-        fig_mem.add_trace(go.Bar(
-            x=mem_keys,
-            y=mem_values,
-            marker_color='#d62728',
-            text=[f"{v:.2f} MB" for v in mem_values],
-            textposition='outside'
-        ))
-        fig_mem.update_layout(
-            title="Memory Usage",
-            xaxis_title="Metric",
-            yaxis_title="Memory (MB)",
-            height=400,
-            showlegend=False
-        )
-        charts_created.append(fig_mem)
+    
     
     # Return list of charts (or None if no charts created)
     return charts_created if charts_created else None
@@ -401,28 +380,7 @@ def create_comparison_chart(baseline_metrics, quantized_metrics, baseline_name, 
             charts_created.append(fig_size)
     
     # Memory comparison (if available)
-    mem_key_baseline = "peak_memory_MB" if "peak_memory_MB" in baseline_metrics else "peak_mem_MB"
-    mem_key_quantized = "peak_memory_MB" if "peak_memory_MB" in quantized_metrics else "peak_mem_MB"
-    if mem_key_baseline in baseline_metrics and mem_key_quantized in quantized_metrics:
-        baseline_mem = baseline_metrics[mem_key_baseline]
-        quantized_mem = quantized_metrics[mem_key_quantized]
-        if baseline_mem > 0 or quantized_mem > 0:
-            fig_mem = go.Figure()
-            fig_mem.add_trace(go.Bar(
-                x=[baseline_name, quantized_name],
-                y=[baseline_mem, quantized_mem],
-                marker_color=['#1f77b4', '#ff7f0e'],
-                text=[f"{baseline_mem:.2f} MB", f"{quantized_mem:.2f} MB"],
-                textposition='outside'
-            ))
-            fig_mem.update_layout(
-                title="Memory Usage Comparison",
-                xaxis_title="Model",
-                yaxis_title="Memory (MB)",
-                height=400,
-                showlegend=False
-            )
-            charts_created.append(fig_mem)
+    
     
     # Return list of charts (or None if no charts created)
     return charts_created if charts_created else None
@@ -492,10 +450,7 @@ if evaluation_mode == "Single Model":
             st.metric("Latency", f"{metrics['Latency (ms)']:.3f} ms")
         with col3:
             st.metric("Model Size", f"{metrics['param_MB']:.2f} MB")
-        with col4:
-            mem_key = "peak_memory_MB" if "peak_memory_MB" in metrics else "peak_mem_MB"
-            mem_val = metrics.get(mem_key, 0.0)
-            st.metric("Peak Memory", f"{mem_val:.2f} MB" if mem_val > 0 else "N/A")
+        
 
         # Create and display charts
         charts = create_metrics_charts(metrics, f"{model_type} — {variant}")
