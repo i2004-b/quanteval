@@ -23,7 +23,12 @@ except ImportError:
 
 # Local imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from ui.model_loader import load_model
+from ui.model_loader import load_model #built-in model
+from ui.model_detection import (
+    load_generic_pytorch_model, 
+    ModelProfile,
+    detect_architecture_type
+) #import model
 from eval.metrics import top1, f1
 from eval.latency import measure_latency_s
 from eval.memory import param_bytes, peak_gpu_mem_once
@@ -45,7 +50,7 @@ MODEL_REGISTRY = {
     "DistilBERT": {
         "Baseline": "distilbert_baseline",
         "int8 (dynamic)": "distilbert_dynamic_int8",
-        "int8 (static)": "distilbert_static_int8",
+        "int8 (static)": "distilbert_static_int8", #doesnt exist yet
         "QAT int8": "distilbert_qat_int8",
     },
 }
@@ -70,6 +75,8 @@ evaluation_mode = st.sidebar.radio(
 # MODEL SELECTION / USER UPLOAD
 # ==========================================================
 if evaluation_mode == "Single Model":
+    use_generic_loader = False 
+    
     model_source = st.sidebar.radio(
         "Choose model source:",
         ["Built-in Model", "Upload Custom Model"]
@@ -83,15 +90,18 @@ if evaluation_mode == "Single Model":
         baseline_key = None
         quantized_key = None
 
-    else:
+    else: #upload custom model
         st.sidebar.write("Upload a `.pt` or `.pth` model file")
         uploaded_file = st.sidebar.file_uploader("Upload model file", type=["pt", "pth"])
-        model_type = st.sidebar.selectbox("Architecture Type", ["ResNet18", "DistilBERT"])
-        variant = "User Upload"
-        model_key = "user_upload"
+        
+        # For generic models, we'll auto-detect the type
+        model_type = None
+        variant = "Custom Upload"
+        model_key = None
         user_model_path = None
         baseline_key = None
         quantized_key = None
+        use_generic_loader = True
 
         if uploaded_file:
             os.makedirs("uploads", exist_ok=True)
@@ -101,6 +111,7 @@ if evaluation_mode == "Single Model":
             user_model_path = temp_path
 
 else:  # Compare Models mode
+    use_generic_loader = False 
     model_type = st.sidebar.selectbox("Model Architecture", list(MODEL_REGISTRY.keys()))
     
     variants = list(MODEL_REGISTRY[model_type].keys())
@@ -112,6 +123,7 @@ else:  # Compare Models mode
     model_key = None
     user_model_path = None
     variant = None
+    use_generic_loader = False
 
 # ----------
 # Common settings
@@ -122,6 +134,53 @@ device = torch.device("cuda" if (device_choice.startswith("cuda") and torch.cuda
 eval_samples = st.sidebar.number_input("Num eval samples", min_value=32, max_value=5000, value=512, step=32)
 latency_runs = st.sidebar.number_input("Latency runs", min_value=5, max_value=200, value=20)
 latency_warmup = st.sidebar.number_input("Latency warmup", min_value=1, max_value=50, value=5)
+
+# ==========================================================
+# IMPORTED MODEL PROFILING DISPLAY
+# ==========================================================
+def display_model_profile(profile: ModelProfile):
+    """Display model profile in Streamlit UI."""
+    st.subheader("🔍 Model Profile")
+    
+    # Key metrics in columns
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Architecture", profile.arch_type)
+    with col2:
+        st.metric("Parameters", f"{profile.param_counts['total']:,}")
+    with col3:
+        st.metric("FP32 Size", f"{profile.size_fp32['size_mb']:.1f} MB")
+    with col4:
+        st.metric("Model Depth", profile.depth)
+    
+    # Expandable detailed info
+    with st.expander("📊 Detailed Profile Information"):
+        profile_dict = profile.to_dict()
+        
+        # Size estimates
+        st.write("**Size Estimates:**")
+        size_df = pd.DataFrame([profile_dict['size_estimates']]).T
+        size_df.columns = ["Size (MB)"]
+        st.dataframe(size_df, width='stretch')
+        
+        # Layer composition (top 10)
+        st.write("**Layer Composition (Top 10):**")
+        layer_comp = dict(list(profile.layer_composition.items())[:10])
+        layer_df = pd.DataFrame(list(layer_comp.items()), columns=["Layer Type", "Count"])
+        st.dataframe(layer_df, width='stretch')
+        
+        # I/O shapes
+        if profile.input_shapes:
+            st.write("**Input Shapes:**")
+            st.json(profile.input_shapes)
+        if profile.output_shapes:
+            st.write("**Output Shapes:**")
+            st.json(profile.output_shapes)
+        
+        # FLOPs
+        if profile.flops:
+            st.write(f"**FLOPs:** {profile.flops:,.0f}")
 
 # ==========================================================
 # EVALUATION PIPELINES
@@ -207,7 +266,39 @@ def evaluate_sst2_model(model, eval_samples, latency_runs, latency_warmup, devic
         "Latency (ms)": float(latency_s * 1000),
         "param_MB": float(param_mb),
     }
-
+    
+def evaluate_generic_model(model, profile, eval_samples, latency_runs, latency_warmup, device):
+    """
+    Fallback evaluation for generic models when we don't have a specific dataset.
+    Just measure latency and size.
+    """
+    st.warning("⚠️ No specific dataset available for this model. Performing basic profiling only.")
+    
+    # Generate sample input based on detected architecture
+    if profile.input_shapes and isinstance(profile.input_shapes, dict):
+        # Try to reconstruct input from shapes
+        sample_input = torch.randn(*profile.input_shapes['shape']).to(device)
+    else:
+        # Fallback to common image input
+        sample_input = torch.randn(1, 3, 224, 224).to(device)
+    
+    # Measure latency
+    latency_s = measure_latency_s(
+        model, sample_input,
+        runs=int(latency_runs),
+        warmup=int(latency_warmup),
+        device=str(device.type),
+    )
+    
+    param_mb = param_bytes(model) / 1e6
+    
+    return {
+        "Accuracy": None,  # Can't measure without dataset
+        "Latency (s)": float(latency_s),
+        "Latency (ms)": float(latency_s * 1000),
+        "param_MB": float(param_mb),
+        "peak_mem_MB": 0.0,
+    }
 
 # ==========================================================
 # VISUALIZATION HELPERS
@@ -290,14 +381,14 @@ def create_metrics_charts(metrics, model_name="Model"):
             height=400,
             showlegend=False
         )
-        charts_created.append(fig_size)
-    
-    # Memory chart
-    
+        charts_created.append(fig_size)    
     
     # Return list of charts (or None if no charts created)
     return charts_created if charts_created else None
 
+# ==========================================================
+# COMPARISON CHARTS
+# ==========================================================
 
 def create_comparison_chart(baseline_metrics, quantized_metrics, baseline_name, quantized_name):
     """Create individual comparison charts between baseline and quantized models."""
@@ -377,10 +468,7 @@ def create_comparison_chart(baseline_metrics, quantized_metrics, baseline_name, 
                 height=400,
                 showlegend=False
             )
-            charts_created.append(fig_size)
-    
-    # Memory comparison (if available)
-    
+            charts_created.append(fig_size)    
     
     # Return list of charts (or None if no charts created)
     return charts_created if charts_created else None
@@ -415,64 +503,124 @@ def calculate_improvements(baseline_metrics, quantized_metrics):
 
 
 # ==========================================================
-# RUN EVALUATION
+# RUN EVALUATION - Single Model
 # ==========================================================
 if evaluation_mode == "Single Model":
-    if st.button("Run Evaluation"):
-        st.info(f"Loading {model_type} — {variant} on {device.type.upper()}...")
-
-        try:
-            model = load_model(model_key, device, user_path=user_model_path, user_model_type=model_type if model_source == "Upload Custom Model" else None)
-            st.success("Model loaded successfully.")
-        except Exception as e:
-            st.error(f"Error loading model: {e}")
+    if st.button("Load Model"):
+        if use_generic_loader and not user_model_path:
+            st.error("Please upload a model file first.")
             st.stop()
+        
+        # Load model
+        if use_generic_loader:
+            st.info(f"Loading custom model on {device.type.upper()}...")
+            model, load_info = load_generic_pytorch_model(user_model_path, str(device))
+            
+            if not load_info["success"]:
+                st.error(f"❌ Failed to load model: {load_info['error']}")
+                if load_info["warnings"]:
+                    for warning in load_info["warnings"]:
+                        st.warning(warning)
+                st.stop()
+            
+            st.success("✅ Model loaded successfully!")
+            
+            # Profile the model
+            st.info("Profiling model...")
+            profile = ModelProfile(model, str(device))
+            display_model_profile(profile)
+                
+            # Auto-detect model type for evaluation
+            model_type = profile.arch_type
+            
+        else:  # Built-in model
+            st.info(f"Loading {model_type} — {variant} on {device.type.upper()}...")
+            try:
+                model = load_model(model_key, device)
+                st.success("✅ Model loaded successfully.")
+                profile = None
+            except Exception as e:
+                st.error(f"Error loading model: {e}")
+                st.stop()
 
         # Evaluate
         st.info("Running evaluation...")
-        if model_type == "ResNet18":
-            metrics = evaluate_cifar10_model(model, eval_samples, latency_runs, latency_warmup, device)
-        elif model_type == "DistilBERT":
-            metrics = evaluate_sst2_model(model, eval_samples, latency_runs, latency_warmup, device)
+        
+        # Determine which evaluation pipeline to use
+        if use_generic_loader:
+            # Check if we recognize the architecture
+            if "ResNet" in str(type(model)) or profile.arch_type == "CNN":
+                # Try CIFAR-10 evaluation
+                try:
+                    metrics = evaluate_cifar10_model(model, eval_samples, latency_runs, latency_warmup, device)
+                except Exception as e:
+                    st.warning(f"CIFAR-10 evaluation failed: {e}. Using generic evaluation.")
+                    metrics = evaluate_generic_model(model, profile, eval_samples, latency_runs, latency_warmup, device)
+            elif "DistilBert" in str(type(model)) or profile.arch_type == "Transformer":
+                # Try SST-2 evaluation
+                try:
+                    metrics = evaluate_sst2_model(model, eval_samples, latency_runs, latency_warmup, device)
+                except Exception as e:
+                    st.warning(f"SST-2 evaluation failed: {e}. Using generic evaluation.")
+                    metrics = evaluate_generic_model(model, profile, eval_samples, latency_runs, latency_warmup, device)
+            else:
+                # Generic evaluation
+                metrics = evaluate_generic_model(model, profile, eval_samples, latency_runs, latency_warmup, device)
         else:
-            st.error("Unsupported model architecture.")
-            st.stop()
+            # Built-in model - use known evaluation pipeline
+            if model_type == "ResNet18":
+                metrics = evaluate_cifar10_model(model, eval_samples, latency_runs, latency_warmup, device)
+            elif model_type == "DistilBERT":
+                metrics = evaluate_sst2_model(model, eval_samples, latency_runs, latency_warmup, device)
+            else:
+                st.error("Unsupported model architecture.")
+                st.stop()
 
         # Results
-        st.subheader(f"📊 Results: {model_type} — {variant}")
+        display_name = variant if not use_generic_loader else f"Custom {model_type}"
+        st.subheader(f"📊 Results: {display_name}")
         
         # Display metrics in columns
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric("Accuracy", f"{metrics['Accuracy']*100:.2f}%")
+            if metrics['Accuracy'] is not None:
+                st.metric("Accuracy", f"{metrics['Accuracy']*100:.2f}%")
+            else:
+                st.metric("Accuracy", "N/A")
         with col2:
             st.metric("Latency", f"{metrics['Latency (ms)']:.3f} ms")
         with col3:
             st.metric("Model Size", f"{metrics['param_MB']:.2f} MB")
-        
+        with col4:
+            mem_key = "peak_memory_MB" if "peak_memory_MB" in metrics else "peak_mem_MB"
+            mem_val = metrics.get(mem_key, 0.0)
+            st.metric("Peak Memory", f"{mem_val:.2f} MB" if mem_val > 0 else "N/A")
 
         # Create and display charts
-        charts = create_metrics_charts(metrics, f"{model_type} — {variant}")
-        if charts is not None:  # Only display if charts were created
+        charts = create_metrics_charts(metrics, display_name)
+        if charts is not None:
             for chart in charts:
-                st.plotly_chart(chart, use_container_width=True)
+                st.plotly_chart(chart, width='stretch')
 
         # Detailed metrics table
         st.subheader("Detailed Metrics")
         metrics_df = pd.DataFrame([metrics]).T
         metrics_df.columns = ["Value"]
-        st.dataframe(metrics_df, use_container_width=True)
+        st.dataframe(metrics_df, width='stretch')
 
         # Log report
         rec = log_experiment(
             metrics,
-            model_name=f"{model_type}-{variant}",
+            model_name=display_name,
             method="ui-eval",
             out_dir="outputs/reports"
         )
         st.success("✅ Logged experiment to outputs/reports")
 
+# ==========================================================
+# COMPARE MODELS MODE - built in only
+# ==========================================================
 else:  # Compare Models mode
     if st.button("Compare Models"):
         if baseline_key == quantized_key:
@@ -567,7 +715,7 @@ else:  # Compare Models mode
         charts = create_comparison_chart(baseline_metrics, quantized_metrics, baseline_variant, quantized_variant)
         if charts is not None:  # Only display if charts were created
             for chart in charts:
-                st.plotly_chart(chart, use_container_width=True)
+                st.plotly_chart(chart, width='stretch')
         
         # Comparison table
         st.subheader("Detailed Comparison")
@@ -575,7 +723,7 @@ else:  # Compare Models mode
             baseline_variant: baseline_metrics,
             quantized_variant: quantized_metrics
         })
-        st.dataframe(comparison_df, use_container_width=True)
+        st.dataframe(comparison_df, width='stretch')
         
         # Log both experiments
         log_experiment(
