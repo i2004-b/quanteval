@@ -111,19 +111,51 @@ if evaluation_mode == "Single Model":
             user_model_path = temp_path
 
 else:  # Compare Models mode
-    use_generic_loader = False 
-    model_type = st.sidebar.selectbox("Model Architecture", list(MODEL_REGISTRY.keys()))
+    comparison_type = st.sidebar.radio(
+        "Comparison Type:",
+        ["Built-in vs Built-in", "Baseline vs Uploaded"]
+    )
     
-    variants = list(MODEL_REGISTRY[model_type].keys())
-    baseline_variant = st.sidebar.selectbox("Baseline Model", variants, index=0)
-    quantized_variant = st.sidebar.selectbox("Quantized Model", variants, index=1 if len(variants) > 1 else 0)
-    
-    baseline_key = MODEL_REGISTRY[model_type][baseline_variant]
-    quantized_key = MODEL_REGISTRY[model_type][quantized_variant]
-    model_key = None
-    user_model_path = None
-    variant = None
-    use_generic_loader = False
+    if comparison_type == "Built-in vs Built-in":
+        use_generic_loader = False
+        model_type = st.sidebar.selectbox("Model Architecture", list(MODEL_REGISTRY.keys()))
+        
+        variants = list(MODEL_REGISTRY[model_type].keys())
+        baseline_variant = st.sidebar.selectbox("Baseline Model", variants, index=0)
+        quantized_variant = st.sidebar.selectbox("Quantized Model", variants, index=1 if len(variants) > 1 else 0)
+        
+        baseline_key = MODEL_REGISTRY[model_type][baseline_variant]
+        quantized_key = MODEL_REGISTRY[model_type][quantized_variant]
+        model_key = None
+        user_model_path = None
+        variant = None
+        baseline_use_generic = False
+        quantized_use_generic = False
+        baseline_profile = None
+        quantized_profile = None
+    else:  # Baseline vs Uploaded
+        model_type = st.sidebar.selectbox("Baseline Model Architecture", list(MODEL_REGISTRY.keys()))
+        variants = list(MODEL_REGISTRY[model_type].keys())
+        baseline_variant = st.sidebar.selectbox("Baseline Model", variants, index=0)
+        baseline_key = MODEL_REGISTRY[model_type][baseline_variant]
+        baseline_use_generic = False
+        
+        st.sidebar.write("---")
+        st.sidebar.write("Upload model to compare:")
+        uploaded_file = st.sidebar.file_uploader("Upload model file", type=["pt", "pth"], key="compare_upload")
+        
+        quantized_key = None
+        quantized_variant = None
+        quantized_use_generic = True
+        user_model_path = None
+        quantized_profile = None
+        
+        if uploaded_file:
+            os.makedirs("uploads", exist_ok=True)
+            temp_path = os.path.join("uploads", uploaded_file.name)
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.read())
+            user_model_path = temp_path
 
 # ----------
 # Common settings
@@ -619,21 +651,28 @@ if evaluation_mode == "Single Model":
         st.success("✅ Logged experiment to outputs/reports")
 
 # ==========================================================
-# COMPARE MODELS MODE - built in only
+# COMPARE MODELS MODE
 # ==========================================================
 else:  # Compare Models mode
     if st.button("Compare Models"):
-        if baseline_key == quantized_key:
-            st.error("Please select different models for comparison.")
-            st.stop()
+        # Validation
+        if comparison_type == "Built-in vs Built-in":
+            if baseline_key == quantized_key:
+                st.error("Please select different models for comparison.")
+                st.stop()
+        else:  # Baseline vs Uploaded
+            if not user_model_path:
+                st.error("Please upload a model file to compare.")
+                st.stop()
         
         results = {}
         
-        # Evaluate baseline
+        # ========== LOAD AND EVALUATE BASELINE ==========
         st.info(f"Loading baseline: {baseline_variant}...")
         try:
             baseline_model = load_model(baseline_key, device)
             st.success(f"✅ Baseline model loaded: {baseline_variant}")
+            baseline_profile = None
         except Exception as e:
             st.error(f"Error loading baseline model: {e}")
             st.stop()
@@ -649,79 +688,141 @@ else:  # Compare Models mode
         
         results["baseline"] = baseline_metrics
         
-        # Evaluate quantized
-        st.info(f"Loading quantized: {quantized_variant}...")
-        try:
-            quantized_model = load_model(quantized_key, device)
-            st.success(f"✅ Quantized model loaded: {quantized_variant}")
-        except Exception as e:
-            st.error(f"Error loading quantized model: {e}")
-            st.stop()
-        
-        st.info("Evaluating quantized model...")
-        if model_type == "ResNet18":
-            quantized_metrics = evaluate_cifar10_model(quantized_model, eval_samples, latency_runs, latency_warmup, device)
-        elif model_type == "DistilBERT":
-            quantized_metrics = evaluate_sst2_model(quantized_model, eval_samples, latency_runs, latency_warmup, device)
-        else:
-            st.error("Unsupported model architecture.")
-            st.stop()
+        # ========== LOAD AND EVALUATE COMPARISON MODEL ==========
+        if comparison_type == "Built-in vs Built-in":
+            # Built-in model
+            st.info(f"Loading comparison model: {quantized_variant}...")
+            try:
+                quantized_model = load_model(quantized_key, device)
+                st.success(f"✅ Comparison model loaded: {quantized_variant}")
+                quantized_profile = None
+            except Exception as e:
+                st.error(f"Error loading comparison model: {e}")
+                st.stop()
+            
+            st.info("Evaluating comparison model...")
+            if model_type == "ResNet18":
+                quantized_metrics = evaluate_cifar10_model(quantized_model, eval_samples, latency_runs, latency_warmup, device)
+            elif model_type == "DistilBERT":
+                quantized_metrics = evaluate_sst2_model(quantized_model, eval_samples, latency_runs, latency_warmup, device)
+            else:
+                st.error("Unsupported model architecture.")
+                st.stop()
+            
+            comparison_name = quantized_variant
+            comparison_display_name = quantized_variant
+            
+        else:  # Baseline vs Uploaded
+            # Uploaded model
+            if not uploaded_file or not user_model_path:
+                st.error("Please upload a model file to compare.")
+                st.stop()
+            
+            st.info(f"Loading uploaded model: {uploaded_file.name}...")
+            model, load_info = load_generic_pytorch_model(user_model_path, str(device))
+            
+            if not load_info["success"]:
+                st.error(f"❌ Failed to load uploaded model: {load_info['error']}")
+                if load_info["warnings"]:
+                    for warning in load_info["warnings"]:
+                        st.warning(warning)
+                st.stop()
+            
+            st.success("✅ Uploaded model loaded successfully!")
+            
+            # Profile the uploaded model
+            st.info("Profiling uploaded model...")
+            quantized_profile = ModelProfile(model, str(device))
+            display_model_profile(quantized_profile)
+            
+            quantized_model = model
+            comparison_name = uploaded_file.name
+            comparison_display_name = f"Uploaded ({quantized_profile.arch_type})"
+            
+            st.info("Evaluating uploaded model...")
+            
+            # Auto-detect evaluation pipeline based on architecture
+            detected_type = quantized_profile.arch_type
+            if "ResNet" in str(type(model)) or detected_type == "CNN":
+                try:
+                    quantized_metrics = evaluate_cifar10_model(quantized_model, eval_samples, latency_runs, latency_warmup, device)
+                except Exception as e:
+                    st.warning(f"CIFAR-10 evaluation failed: {e}. Using generic evaluation.")
+                    quantized_metrics = evaluate_generic_model(quantized_model, quantized_profile, eval_samples, latency_runs, latency_warmup, device)
+            elif "DistilBert" in str(type(model)) or detected_type == "Transformer":
+                try:
+                    quantized_metrics = evaluate_sst2_model(quantized_model, eval_samples, latency_runs, latency_warmup, device)
+                except Exception as e:
+                    st.warning(f"SST-2 evaluation failed: {e}. Using generic evaluation.")
+                    quantized_metrics = evaluate_generic_model(quantized_model, quantized_profile, eval_samples, latency_runs, latency_warmup, device)
+            else:
+                quantized_metrics = evaluate_generic_model(quantized_model, quantized_profile, eval_samples, latency_runs, latency_warmup, device)
         
         results["quantized"] = quantized_metrics
         
-        # Display comparison
-        st.subheader(f"📊 Comparison: {baseline_variant} vs {quantized_variant}")
+        # ========== DISPLAY COMPARISON ==========
+        baseline_display_name = f"{baseline_variant} (Baseline)"
+        st.subheader(f"📊 Comparison: {baseline_display_name} vs {comparison_display_name}")
         
         # Side-by-side metrics
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown(f"### {baseline_variant} (Baseline)")
-            st.metric("Accuracy", f"{baseline_metrics['Accuracy']*100:.2f}%")
+            st.markdown(f"### {baseline_display_name}")
+            if baseline_metrics['Accuracy'] is not None:
+                st.metric("Accuracy", f"{baseline_metrics['Accuracy']*100:.2f}%")
+            else:
+                st.metric("Accuracy", "N/A")
             st.metric("Latency", f"{baseline_metrics['Latency (ms)']:.3f} ms")
             st.metric("Model Size", f"{baseline_metrics['param_MB']:.2f} MB")
         
         with col2:
-            st.markdown(f"### {quantized_variant} (Quantized)")
-            st.metric("Accuracy", f"{quantized_metrics['Accuracy']*100:.2f}%")
+            st.markdown(f"### {comparison_display_name}")
+            if quantized_metrics['Accuracy'] is not None:
+                st.metric("Accuracy", f"{quantized_metrics['Accuracy']*100:.2f}%")
+            else:
+                st.metric("Accuracy", "N/A")
             st.metric("Latency", f"{quantized_metrics['Latency (ms)']:.3f} ms")
             st.metric("Model Size", f"{quantized_metrics['param_MB']:.2f} MB")
         
-        # Improvement metrics
-        improvements = calculate_improvements(baseline_metrics, quantized_metrics)
-        
-        st.subheader("📈 Improvements")
-        imp_col1, imp_col2, imp_col3 = st.columns(3)
-        
-        if "Accuracy" in improvements:
-            with imp_col1:
-                acc_imp = improvements["Accuracy"]
-                delta = f"{acc_imp['relative']:+.2f}%"
-                st.metric("Accuracy Change", f"{acc_imp['absolute']*100:+.2f}%", delta=delta)
-        
-        if "Latency" in improvements:
-            with imp_col2:
-                lat_imp = improvements["Latency"]
-                delta = f"{lat_imp['relative']:+.2f}%"
-                st.metric("Latency Change", f"{lat_imp['absolute']:+.3f} ms", delta=delta)
-        
-        if "Model Size" in improvements:
-            with imp_col3:
-                size_imp = improvements["Model Size"]
-                delta = f"{size_imp['relative']:+.2f}%"
-                st.metric("Size Reduction", f"{size_imp['absolute']:.2f} MB", delta=delta)
+        # Improvement metrics (only if both have accuracy)
+        if baseline_metrics.get('Accuracy') is not None and quantized_metrics.get('Accuracy') is not None:
+            improvements = calculate_improvements(baseline_metrics, quantized_metrics)
+            
+            st.subheader("📈 Improvements")
+            imp_col1, imp_col2, imp_col3 = st.columns(3)
+            
+            if "Accuracy" in improvements:
+                with imp_col1:
+                    acc_imp = improvements["Accuracy"]
+                    delta = f"{acc_imp['relative']:+.2f}%"
+                    st.metric("Accuracy Change", f"{acc_imp['absolute']*100:+.2f}%", delta=delta)
+            
+            if "Latency" in improvements:
+                with imp_col2:
+                    lat_imp = improvements["Latency"]
+                    delta = f"{lat_imp['relative']:+.2f}%"
+                    st.metric("Latency Change", f"{lat_imp['absolute']:+.3f} ms", delta=delta)
+            
+            if "Model Size" in improvements:
+                with imp_col3:
+                    size_imp = improvements["Model Size"]
+                    delta = f"{size_imp['relative']:+.2f}%"
+                    st.metric("Size Reduction", f"{size_imp['absolute']:.2f} MB", delta=delta)
+        else:
+            st.info("⚠️ Accuracy comparison not available (one or both models don't have accuracy metrics)")
         
         # Comparison charts
-        charts = create_comparison_chart(baseline_metrics, quantized_metrics, baseline_variant, quantized_variant)
-        if charts is not None:  # Only display if charts were created
+        charts = create_comparison_chart(baseline_metrics, quantized_metrics, baseline_display_name, comparison_display_name)
+        if charts is not None:
             for chart in charts:
                 st.plotly_chart(chart, width='stretch')
         
         # Comparison table
         st.subheader("Detailed Comparison")
         comparison_df = pd.DataFrame({
-            baseline_variant: baseline_metrics,
-            quantized_variant: quantized_metrics
+            baseline_display_name: baseline_metrics,
+            comparison_display_name: quantized_metrics
         })
         st.dataframe(comparison_df, width='stretch')
         
@@ -734,7 +835,7 @@ else:  # Compare Models mode
         )
         log_experiment(
             quantized_metrics,
-            model_name=f"{model_type}-{quantized_variant}",
+            model_name=f"{comparison_name}",
             method="ui-eval-comparison",
             out_dir="outputs/reports"
         )
