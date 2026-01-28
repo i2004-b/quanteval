@@ -42,6 +42,8 @@ from ui.comparison_orchestrator import (
     ComparisonGroup,
     WorkflowType as OrchestratorWorkflowType
 )
+from ui.explanations import beginner_conclusion
+from ui.recommendation import recommend_comparison_target
 from eval.metrics import top1, f1
 from eval.latency import measure_latency_s
 from eval.memory import param_bytes, peak_gpu_mem_once
@@ -78,27 +80,48 @@ st.title("🧠 Quanteval — Model Evaluation UI")
 st.markdown("""
 **A comprehensive quantization benchmarking framework for PyTorch models**
 
-Choose your evaluation mode:
-- **Single Model**: Evaluate one model's performance
-- **Compare Models**: Manually compare two models side-by-side
-- **Intelligent Benchmarking**: Automatically detect and compare models (recommended for beginners)
+Choose your user mode:
+- **Beginner Mode (Intelligent Benchmarking)**: goal-driven, guided comparisons + explanations
+- **Advanced Mode (Full Control)**: manual selection, full metrics visibility, and tunable parameters
 """)
 
 st.sidebar.header("⚙️ Evaluation Options")
 
 # ==========================================================
-# EVALUATION MODE SELECTION
+# USER MODE SELECTION (CORE REQUIREMENT)
 # ==========================================================
-evaluation_mode = st.sidebar.radio(
-    "📊 Evaluation Mode:",
-    ["Single Model", "Compare Models", "Intelligent Benchmarking"],
-    help="Choose how you want to evaluate models. Intelligent Benchmarking is recommended for beginners."
+user_mode = st.sidebar.radio(
+    "👤 User Mode:",
+    ["Beginner Mode", "Advanced Mode"],
+    help="Beginner Mode provides guided, goal-driven benchmarking with explanations. Advanced Mode exposes full control."
 )
+
+# We keep the existing evaluation flows, but route them through the two-mode UX.
+if user_mode == "Beginner Mode":
+    evaluation_mode = "Beginner"
+    beginner_goal = st.sidebar.radio(
+        "What do you want to do?",
+        [
+            "Learn how quantization affects models",
+            "Upload a model and understand its properties",
+            "Compare my uploaded model against a baseline",
+        ],
+        help="Beginner Mode hides unnecessary knobs and focuses on clear conclusions."
+    )
+else:
+    evaluation_mode = st.sidebar.radio(
+        "📊 Advanced Workflow:",
+        ["Single Model", "Compare Models", "Multi-Model (Advanced)"],
+        help="Full control benchmarking: upload/select multiple models and compare manually."
+    )
+
+# Internal routing: reuse existing flows without rewriting evaluation logic.
+internal_mode = "Intelligent Benchmarking" if evaluation_mode == "Beginner" else evaluation_mode
 
 # ==========================================================
 # MODEL SELECTION / USER UPLOAD
 # ==========================================================
-if evaluation_mode == "Single Model":
+if internal_mode == "Single Model":
     use_generic_loader = False 
     
     model_source = st.sidebar.radio(
@@ -134,7 +157,7 @@ if evaluation_mode == "Single Model":
                 f.write(uploaded_file.read())
             user_model_path = temp_path
 
-elif evaluation_mode == "Compare Models":  # Compare Models mode
+elif internal_mode == "Compare Models":  # Compare Models mode
     comparison_type = st.sidebar.radio(
         "Comparison Type:",
         ["Built-in vs Built-in", "Baseline vs Uploaded"]
@@ -181,7 +204,7 @@ elif evaluation_mode == "Compare Models":  # Compare Models mode
                 f.write(uploaded_file.read())
             user_model_path = temp_path
 
-elif evaluation_mode == "Intelligent Benchmarking":
+elif internal_mode == "Intelligent Benchmarking":
     # Intelligent Benchmarking mode - skip model selection here
     # All logic is handled in the execution section below
     pass
@@ -189,7 +212,7 @@ elif evaluation_mode == "Intelligent Benchmarking":
 # ----------
 # Common settings (only for Single Model and Compare Models modes)
 # ----------
-if evaluation_mode in ["Single Model", "Compare Models"]:
+if internal_mode in ["Single Model", "Compare Models", "Multi-Model (Advanced)"]:
     device_choice = st.sidebar.selectbox("Run on", ["cpu", "cuda (if available)"])
     device = torch.device("cuda" if (device_choice.startswith("cuda") and torch.cuda.is_available()) else "cpu")
 
@@ -685,7 +708,7 @@ def evaluate_model_with_metadata(
 # ==========================================================
 # RUN EVALUATION - Single Model
 # ==========================================================
-if evaluation_mode == "Single Model":
+if internal_mode == "Single Model":
     if st.button("Load Model"):
         if use_generic_loader and not user_model_path:
             st.error("Please upload a model file first.")
@@ -801,7 +824,7 @@ if evaluation_mode == "Single Model":
 # ==========================================================
 # COMPARE MODELS MODE
 # ==========================================================
-elif evaluation_mode == "Compare Models":  # Compare Models mode
+elif internal_mode == "Compare Models":  # Compare Models mode
     if st.button("Compare Models"):
         # Validation
         if comparison_type == "Built-in vs Built-in":
@@ -990,10 +1013,143 @@ elif evaluation_mode == "Compare Models":  # Compare Models mode
         st.success("✅ Both experiments logged to outputs/reports")
 
 # ==========================================================
+# MULTI-MODEL (ADVANCED) MODE
+# ==========================================================
+elif internal_mode == "Multi-Model (Advanced)":
+    st.header("🧪 Multi-Model Benchmarking (Advanced)")
+    st.caption("Upload and benchmark multiple models, then compare them manually.")
+
+    init_saved_models()
+    saved_models = get_saved_models()
+
+    st.sidebar.header("📦 Model Set")
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload one or more `.pt` / `.pth` model files",
+        type=["pt", "pth"],
+        accept_multiple_files=True,
+        key="advanced_multi_upload",
+    )
+
+    # Persist a model set separate from the Beginner 'saved_models' list.
+    if "advanced_model_set" not in st.session_state:
+        st.session_state.advanced_model_set = {}  # name -> {"path":..., "metadata":..., "metrics":...}
+
+    if uploaded_files:
+        if st.sidebar.button("➕ Add uploaded models to set", key="advanced_add_to_set"):
+            os.makedirs("uploads", exist_ok=True)
+            for f in uploaded_files:
+                path = os.path.join("uploads", f.name)
+                with open(path, "wb") as out:
+                    out.write(f.read())
+                st.session_state.advanced_model_set[f.name] = {"path": path, "metadata": None, "metrics": None}
+            st.sidebar.success(f"Added {len(uploaded_files)} model(s) to the set.")
+            st.rerun()
+
+    # Also allow selecting from already-saved models
+    if saved_models:
+        chosen_saved = st.sidebar.multiselect(
+            "Add from Saved Models",
+            options=list(saved_models.keys()),
+            default=[],
+            key="advanced_add_saved_models",
+        )
+        if st.sidebar.button("➕ Add selected saved models to set", key="advanced_add_saved_to_set"):
+            for name in chosen_saved:
+                st.session_state.advanced_model_set[name] = {
+                    "path": saved_models[name]["path"],
+                    "metadata": saved_models[name].get("metadata"),
+                    "metrics": None,
+                }
+            st.sidebar.success(f"Added {len(chosen_saved)} saved model(s) to the set.")
+            st.rerun()
+
+    st.sidebar.write("---")
+    st.sidebar.header("⚙️ Evaluation Settings")
+    device_choice = st.sidebar.selectbox("Run on", ["cpu", "cuda (if available)"], key="advanced_multi_device")
+    device = torch.device("cuda" if (device_choice.startswith("cuda") and torch.cuda.is_available()) else "cpu")
+    eval_samples = st.sidebar.number_input("Num eval samples", min_value=32, max_value=5000, value=512, step=32, key="advanced_multi_samples")
+    latency_runs = st.sidebar.number_input("Latency runs", min_value=5, max_value=200, value=20, key="advanced_multi_latency_runs")
+    latency_warmup = st.sidebar.number_input("Latency warmup", min_value=1, max_value=50, value=5, key="advanced_multi_warmup")
+
+    model_set = st.session_state.advanced_model_set
+    if not model_set:
+        st.info("Add models to your model set from the sidebar to begin.")
+        st.stop()
+
+    st.subheader("📋 Current Model Set")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "name": name,
+                    "path": info.get("path"),
+                    "has_metadata": info.get("metadata") is not None,
+                    "has_metrics": info.get("metrics") is not None,
+                }
+                for name, info in model_set.items()
+            ]
+        ),
+        width='stretch',
+    )
+
+    if st.button("▶️ Run evaluation for model set", key="advanced_multi_eval"):
+        from ui.model_detection import load_generic_pytorch_model
+        from ui.model_inspection import inspect_model, ModelSource
+
+        for name, info in model_set.items():
+            st.info(f"Loading {name}...")
+            model, load_info = load_generic_pytorch_model(info["path"], str(device))
+            if not load_info["success"]:
+                st.error(f"Failed to load {name}: {load_info['error']}")
+                continue
+
+            metadata = inspect_model(model, source=ModelSource.USER, file_path=info["path"], device=str(device))
+            metrics = evaluate_model_with_metadata(model, metadata, eval_samples, latency_runs, latency_warmup, device)
+
+            info["metadata"] = metadata.to_dict()
+            info["metrics"] = metrics
+
+        st.success("Finished evaluating available models in the set.")
+        st.rerun()
+
+    # Comparison UI (pairwise)
+    evaluated = {n: i for n, i in model_set.items() if i.get("metrics")}
+    if len(evaluated) < 2:
+        st.info("Evaluate at least two models to compare them.")
+        st.stop()
+
+    st.subheader("⚖️ Pairwise Comparison")
+    names = list(evaluated.keys())
+    left = st.selectbox("Model A", names, index=0, key="advanced_pair_left")
+    right = st.selectbox("Model B", names, index=1 if len(names) > 1 else 0, key="advanced_pair_right")
+
+    m1 = evaluated[left]["metrics"]
+    m2 = evaluated[right]["metrics"]
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(f"### {left}")
+        st.json(evaluated[left].get("metadata") or {})
+        st.dataframe(pd.DataFrame([m1]).T, width='stretch')
+    with col2:
+        st.markdown(f"### {right}")
+        st.json(evaluated[right].get("metadata") or {})
+        st.dataframe(pd.DataFrame([m2]).T, width='stretch')
+
+    if st.toggle("Generate explanation (optional)", value=False, key="advanced_pair_explain"):
+        headline, explanation = beginner_conclusion(left, right, m1, m2)
+        st.subheader("🧾 Explanation")
+        st.success(headline)
+        st.write(explanation)
+
+# ==========================================================
 # INTELLIGENT BENCHMARKING MODE
 # ==========================================================
-elif evaluation_mode == "Intelligent Benchmarking":
-    st.header("🧠 Intelligent Benchmarking")
+elif internal_mode == "Intelligent Benchmarking":
+    if user_mode == "Beginner Mode":
+        st.header("🧠 Beginner Mode — Intelligent Benchmarking")
+        st.caption(f"Goal: {beginner_goal}")
+    else:
+        st.header("🧠 Intelligent Benchmarking")
     st.markdown("""
     <div style='background-color: #e8f4f8; padding: 15px; border-radius: 5px; margin-bottom: 20px;'>
     <h4 style='margin-top: 0;'>✨ Perfect for Beginners</h4>
@@ -1009,6 +1165,57 @@ elif evaluation_mode == "Intelligent Benchmarking":
     
     Just upload your model and let the system do the rest! 🚀
     """)
+
+    # Beginner goal: educational demo using built-in models (no upload required)
+    if user_mode == "Beginner Mode" and beginner_goal == "Learn how quantization affects models":
+        st.subheader("🎓 Guided demo (built-in examples)")
+        st.caption("Pick an example baseline and a quantized variant to see the tradeoffs, with plain-language conclusions.")
+
+        demo_arch = st.selectbox("Example architecture", list(MODEL_REGISTRY.keys()), key="beginner_demo_arch")
+        demo_variants = list(MODEL_REGISTRY[demo_arch].keys())
+        demo_base_variant = st.selectbox("Baseline", demo_variants, index=0, key="beginner_demo_base")
+        demo_quant_variant = st.selectbox(
+            "Quantized variant",
+            demo_variants,
+            index=1 if len(demo_variants) > 1 else 0,
+            key="beginner_demo_quant"
+        )
+
+        if st.button("▶️ Run demo comparison", key="beginner_demo_run"):
+            baseline_key = MODEL_REGISTRY[demo_arch][demo_base_variant]
+            quantized_key = MODEL_REGISTRY[demo_arch][demo_quant_variant]
+
+            st.info("Loading models...")
+            baseline_model = load_model(baseline_key, device)
+            quantized_model = load_model(quantized_key, device)
+
+            baseline_md = inspect_model_from_registry(baseline_key, baseline_model, str(device))
+            quant_md = inspect_model_from_registry(quantized_key, quantized_model, str(device))
+
+            st.info("Running evaluation...")
+            baseline_metrics = evaluate_model_with_metadata(baseline_model, baseline_md, eval_samples, latency_runs, latency_warmup, device)
+            quant_metrics = evaluate_model_with_metadata(quantized_model, quant_md, eval_samples, latency_runs, latency_warmup, device)
+
+            st.subheader("📊 Results")
+            headline, explanation = beginner_conclusion(
+                f"{demo_arch} — {demo_base_variant}",
+                f"{demo_arch} — {demo_quant_variant}",
+                baseline_metrics,
+                quant_metrics,
+            )
+            st.success(headline)
+            st.write(explanation)
+
+            st.dataframe(
+                pd.DataFrame(
+                    {
+                        f"{demo_base_variant}": baseline_metrics,
+                        f"{demo_quant_variant}": quant_metrics,
+                    }
+                ),
+                width='stretch',
+            )
+        st.write("---")
     
     # Initialize saved models
     init_saved_models()
@@ -1059,38 +1266,70 @@ elif evaluation_mode == "Intelligent Benchmarking":
     # Settings
     st.sidebar.header("⚙️ Evaluation Settings")
     device_choice = st.sidebar.selectbox(
-        "Run on", 
-        ["cpu", "cuda (if available)"], 
+        "Run on",
+        ["cpu", "cuda (if available)"],
         key="intelligent_device",
         help="Device to run evaluation on"
     )
     device = torch.device("cuda" if (device_choice.startswith("cuda") and torch.cuda.is_available()) else "cpu")
-    
-    eval_samples = st.sidebar.number_input(
-        "Num eval samples", 
-        min_value=32, 
-        max_value=5000, 
-        value=512, 
-        step=32, 
-        key="intelligent_samples",
-        help="Number of samples to use for accuracy evaluation"
-    )
-    latency_runs = st.sidebar.number_input(
-        "Latency runs", 
-        min_value=5, 
-        max_value=200, 
-        value=20, 
-        key="intelligent_latency_runs",
-        help="Number of inference runs to average for latency measurement"
-    )
-    latency_warmup = st.sidebar.number_input(
-        "Latency warmup", 
-        min_value=1, 
-        max_value=50, 
-        value=5, 
-        key="intelligent_warmup",
-        help="Number of warmup runs before measuring latency"
-    )
+
+    # Beginner Mode: hide knobs by default (but keep them accessible)
+    if user_mode == "Beginner Mode":
+        eval_samples = 200
+        latency_runs = 50
+        latency_warmup = 10
+        with st.sidebar.expander("Show advanced settings"):
+            eval_samples = st.number_input(
+                "Num eval samples",
+                min_value=32,
+                max_value=5000,
+                value=int(eval_samples),
+                step=32,
+                key="intelligent_samples",
+                help="Number of samples to use for accuracy evaluation"
+            )
+            latency_runs = st.number_input(
+                "Latency runs",
+                min_value=5,
+                max_value=200,
+                value=int(latency_runs),
+                key="intelligent_latency_runs",
+                help="Number of inference runs to average for latency measurement"
+            )
+            latency_warmup = st.number_input(
+                "Latency warmup",
+                min_value=1,
+                max_value=50,
+                value=int(latency_warmup),
+                key="intelligent_warmup",
+                help="Number of warmup runs before measuring latency"
+            )
+    else:
+        eval_samples = st.sidebar.number_input(
+            "Num eval samples",
+            min_value=32,
+            max_value=5000,
+            value=512,
+            step=32,
+            key="intelligent_samples",
+            help="Number of samples to use for accuracy evaluation"
+        )
+        latency_runs = st.sidebar.number_input(
+            "Latency runs",
+            min_value=5,
+            max_value=200,
+            value=20,
+            key="intelligent_latency_runs",
+            help="Number of inference runs to average for latency measurement"
+        )
+        latency_warmup = st.sidebar.number_input(
+            "Latency warmup",
+            min_value=1,
+            max_value=50,
+            value=5,
+            key="intelligent_warmup",
+            help="Number of warmup runs before measuring latency"
+        )
     
     # Determine which model to use (saved or uploaded)
     model_to_use = None
@@ -1219,6 +1458,22 @@ elif evaluation_mode == "Intelligent Benchmarking":
             st.metric("Peak Memory", f"{initial_metrics.get('peak_mem_MB', 0):.2f} MB" if initial_metrics.get('peak_mem_MB', 0) > 0 else "N/A")
         
         st.write("---")
+
+        # Beginner goal: analysis-only (no comparison required)
+        if user_mode == "Beginner Mode" and beginner_goal == "Upload a model and understand its properties":
+            st.subheader("🧾 What these results mean")
+            if initial_metrics.get("Accuracy") is None:
+                st.info(
+                    "Accuracy is not available for this model in the current pipeline (this usually means we couldn't confidently match it to a known dataset/task). "
+                    "Latency, memory/size, and architecture detection are still useful for understanding deployment tradeoffs."
+                )
+            else:
+                st.write(
+                    "Accuracy tells you how often the model is correct on the evaluation dataset. "
+                    "Latency (ms) is inference time per example, and Model Size is derived from parameter storage."
+                )
+            st.success("**Conclusion:** Your model has been analyzed successfully. Use the other Beginner goals to compare it against a baseline.")
+            st.stop()
         
         # NOW determine workflow and show comparison options AFTER evaluation
         orchestrator = get_comparison_orchestrator()
@@ -1244,6 +1499,49 @@ elif evaluation_mode == "Intelligent Benchmarking":
                 2. Register a baseline in the system
                 3. Continue with single model evaluation
                 """)
+
+                # Beginner Mode: try to recommend a similar uploaded model if available
+                if user_mode == "Beginner Mode" and beginner_goal == "Compare my uploaded model against a baseline":
+                    rec = recommend_comparison_target(metadata, saved_models=saved_models)
+                    if rec.mode == "uploaded_similar" and rec.uploaded_model_name:
+                        st.info(f"Suggested comparison: **{rec.uploaded_model_name}** (similar uploaded model).")
+                        if st.button("⚖️ Compare with suggested uploaded model", key="compare_with_suggested_uploaded"):
+                            from ui.model_detection import load_generic_pytorch_model
+                            from ui.model_inspection import inspect_model, ModelSource
+
+                            other_path = saved_models[rec.uploaded_model_name]["path"]
+                            other_model, other_load = load_generic_pytorch_model(other_path, str(device))
+                            if not other_load["success"]:
+                                st.error(f"Failed to load suggested model: {other_load['error']}")
+                                st.stop()
+
+                            other_md = inspect_model(other_model, source=ModelSource.USER, file_path=other_path, device=str(device))
+                            other_metrics = evaluate_model_with_metadata(
+                                other_model, other_md, eval_samples, latency_runs, latency_warmup, device
+                            )
+
+                            headline, explanation = beginner_conclusion(
+                                rec.uploaded_model_name,
+                                "Your uploaded model",
+                                other_metrics,
+                                initial_metrics,
+                            )
+                            st.subheader("🧾 Explanation")
+                            st.success(headline)
+                            st.write(explanation)
+
+                            st.dataframe(
+                                pd.DataFrame(
+                                    {
+                                        rec.uploaded_model_name: other_metrics,
+                                        "Your uploaded model": initial_metrics,
+                                    }
+                                ),
+                                width='stretch',
+                            )
+                            st.stop()
+                    else:
+                        st.info("Tip: Save or upload a baseline/similar model to enable comparisons, or continue in analysis-only mode.")
                 
                 # Option to compare with baseline manually
                 # Check if comparison already done
@@ -1307,6 +1605,18 @@ elif evaluation_mode == "Intelligent Benchmarking":
                             st.metric("Accuracy", f"{quantized_metrics['Accuracy']*100:.2f}%")
                         st.metric("Latency", f"{quantized_metrics['Latency (ms)']:.3f} ms")
                         st.metric("Model Size", f"{quantized_metrics['param_MB']:.2f} MB")
+
+                    # Beginner Mode: required human-readable explanation
+                    if user_mode == "Beginner Mode":
+                        st.subheader("🧾 Explanation")
+                        headline, explanation = beginner_conclusion(
+                            "Baseline (FP32)",
+                            "Quantized Model",
+                            baseline_metrics,
+                            quantized_metrics,
+                        )
+                        st.success(headline)
+                        st.write(explanation)
                     
                     # Improvements
                     if baseline_metrics.get('Accuracy') and quantized_metrics.get('Accuracy'):
@@ -1426,6 +1736,18 @@ elif evaluation_mode == "Intelligent Benchmarking":
                             st.metric("Accuracy", f"{quantized_metrics['Accuracy']*100:.2f}%")
                         st.metric("Latency", f"{quantized_metrics['Latency (ms)']:.3f} ms")
                         st.metric("Model Size", f"{quantized_metrics['param_MB']:.2f} MB")
+
+                    # Beginner Mode: required human-readable explanation
+                    if user_mode == "Beginner Mode":
+                        st.subheader("🧾 Explanation")
+                        headline, explanation = beginner_conclusion(
+                            "Baseline (FP32)",
+                            "Quantized Model",
+                            baseline_metrics,
+                            quantized_metrics,
+                        )
+                        st.success(headline)
+                        st.write(explanation)
                     
                     # Improvements
                     if baseline_metrics.get('Accuracy') and quantized_metrics.get('Accuracy'):
@@ -1817,6 +2139,17 @@ elif evaluation_mode == "Intelligent Benchmarking":
                             f"**Recommended**: {best_variant['metadata'].quantization_method.value.upper()} "
                             f"for best balance of accuracy retention and speedup"
                         )
+
+                        if user_mode == "Beginner Mode":
+                            st.subheader("🧾 Explanation (baseline vs recommended)")
+                            headline, explanation = beginner_conclusion(
+                                "Baseline (FP32)",
+                                f"{best_variant['metadata'].quantization_method.value.upper()}",
+                                baseline_metrics,
+                                best_variant["metrics"],
+                            )
+                            st.success(headline)
+                            st.write(explanation)
                     
                     # Export/Download buttons
                     st.subheader("💾 Export Results")
