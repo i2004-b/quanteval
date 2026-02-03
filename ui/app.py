@@ -3,6 +3,14 @@
 import streamlit as st
 import warnings
 import logging
+import sys
+from pathlib import Path
+
+# Ensure project root is on sys.path so `ui` package imports resolve when
+# running `streamlit run ui/app.py` or executing the file directly.
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 import os
 import torch
 import pandas as pd
