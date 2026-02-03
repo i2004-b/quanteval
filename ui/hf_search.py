@@ -38,3 +38,81 @@ def search_hf_models(architecture: str, limit: int = 15):
                 results.append(m.modelId)
 
     return results[:5]  # keep UI clean
+
+
+def search_hf_models_debug(architecture: str, limit: int = 20):
+    """
+    Debugging search: run multiple query variants and return per-query diagnostics.
+
+    Returns:
+      (candidates: list[str], diagnostics: list[dict])
+    """
+    api = HfApi()
+    arch = architecture.strip()
+    queries = [
+        arch,
+        arch.lower(),
+        arch.replace(" ", "-"),
+        f"{arch} cifar10",
+        f"{arch} sst2",
+        f"{arch} resnet",
+        f"{arch} mobilenet",
+        f"{arch} efficientnet",
+        f"{arch} quant",
+        f"{arch} int8",
+    ]
+
+    seen = set()
+    candidates = []
+    diagnostics = []
+
+    for q in queries:
+        try:
+            models = api.list_models(search=q, limit=limit)
+            model_ids = [m.modelId for m in models]
+            pytorch_counts = 0
+            sample = []
+            for mid in model_ids[:10]:
+                ok = False
+                try:
+                    ok = is_pytorch_model(mid)
+                except Exception:
+                    ok = False
+                if ok:
+                    pytorch_counts += 1
+                sample.append({"id": mid, "pytorch": ok})
+
+            diagnostics.append({
+                "query": q,
+                "total_found": len(model_ids),
+                "pytorch_count": pytorch_counts,
+                "sample": sample[:5],
+            })
+
+            # Prefer quantized/intentional names first
+            for mid in model_ids:
+                low = mid.lower()
+                if mid in seen:
+                    continue
+                if any(x in low for x in ["int8", "quant", "qat", "ptq"]):
+                    if is_pytorch_model(mid):
+                        candidates.append(mid)
+                        seen.add(mid)
+
+            # Fallback: add any pytorch models
+            for mid in model_ids:
+                if mid in seen:
+                    continue
+                try:
+                    if is_pytorch_model(mid):
+                        candidates.append(mid)
+                        seen.add(mid)
+                except Exception:
+                    continue
+
+        except Exception as e:
+            diagnostics.append({"query": q, "error": str(e)})
+            continue
+
+    # Trim and return
+    return candidates[:10], diagnostics
