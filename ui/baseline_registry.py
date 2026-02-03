@@ -116,12 +116,24 @@ class BaselineRegistry:
         Returns:
             Model key if baseline found, None otherwise
         """
+        # Try exact match first
         key = metadata.get_comparison_key()
         entry = self._registry.get(key)
-        
         if entry:
             return entry.model_key
-        
+
+        # Fuzzy fallback: try to match architecture variants (e.g., 'ResNet' -> 'ResNet18')
+        arch = metadata.architecture or ""
+        task = metadata.task.value
+        dataset = metadata.dataset.value
+
+        for (a, t, d), e in self._registry.items():
+            if t != task or d != dataset:
+                continue
+            # case-insensitive containment or prefix heuristics
+            if a.lower() == arch.lower() or arch.lower() in a.lower() or a.lower() in arch.lower():
+                return e.model_key
+
         return None
     
     def find_baseline_by_key(

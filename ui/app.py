@@ -1,35 +1,31 @@
 # ui/app.py
 # Run: streamlit run ui/app.py
 import streamlit as st
+import warnings
+import logging
+import os
 import torch
-import torch.nn as nn
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-import os, sys
-import json
-from transformers import DistilBertTokenizer
 import pandas as pd
+import torchvision
+from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
+from transformers import DistilBertTokenizer
 from datasets import load_dataset
+from ui.model_detection import (
+    load_generic_pytorch_model,
+    ModelProfile,
+    detect_architecture_type,
+)
+from ui.model_loader import load_model, load_hf_model_by_name
+import json
+import time
+import traceback
 
-# Try to import plotly, fallback to streamlit native charts
 try:
     import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
     PLOTLY_AVAILABLE = True
-except ImportError:
+except Exception:
     PLOTLY_AVAILABLE = False
-    go = None
-    make_subplots = None
-
-# Local imports
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from ui.model_loader import load_model #built-in model
-from ui.model_detection import (
-    load_generic_pytorch_model, 
-    ModelProfile,
-    detect_architecture_type
-) #import model
 from ui.model_inspection import (
     inspect_model,
     inspect_model_from_registry,
@@ -37,16 +33,21 @@ from ui.model_inspection import (
     ModelSource
 )
 from ui.baseline_registry import get_baseline_registry
-from ui.comparison_orchestrator import (
-    get_comparison_orchestrator,
-    ComparisonGroup,
-    WorkflowType as OrchestratorWorkflowType
-)
+from ui.comparison_orchestrator import get_comparison_orchestrator, ComparisonGroup
 from ui.explanations import beginner_conclusion
 from ui.recommendation import recommend_comparison_target
+from ui.model_analysis import ModelAnalysisResult, analyze_uploaded_model as analyze_uploaded_model_analysis, analyze_builtin_model
+from ui.comparison_planner import (
+    EntryPath,
+    ComparisonIntent,
+    ComparisonPlan,
+    plan_learn,
+    plan_upload,
+    get_builtin_architectures,
+)
 from eval.metrics import top1, f1
 from eval.latency import measure_latency_s
-from eval.memory import param_bytes, peak_gpu_mem_once
+from eval.memory import param_bytes, peak_gpu_mem_once, on_disk_bytes_state_dict
 from eval.report import log_experiment
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -65,7 +66,7 @@ MODEL_REGISTRY = {
     "DistilBERT": {
         "Baseline": "distilbert_baseline",
         "int8 (dynamic)": "distilbert_dynamic_int8",
-        "int8 (static)": "distilbert_static_int8", #doesnt exist yet
+        #"int8 (static)": "distilbert_static_int8", #doesnt exist yet
         "QAT int8": "distilbert_qat_int8",
     },
 }
@@ -75,156 +76,145 @@ MODEL_REGISTRY = {
 # ==========================================================
 st.set_page_config(page_title="Quanteval — Model Evaluation", layout="wide", page_icon="🧠")
 
-# Main title with description
-st.title("🧠 Quanteval — Model Evaluation UI")
-st.markdown("""
-**A comprehensive quantization benchmarking framework for PyTorch models**
+# Session state for entry path (Learn vs Upload)
+if "entry_path" not in st.session_state:
+    st.session_state.entry_path = None  # None | "learn" | "upload"
+if "comparison_plan" not in st.session_state:
+    st.session_state.comparison_plan = None  # ComparisonPlan when set
+if "presentation_mode" not in st.session_state:
+    st.session_state.presentation_mode = "Beginner"  # for Path B only
 
-Choose your user mode:
-- **Beginner Mode (Intelligent Benchmarking)**: goal-driven, guided comparisons + explanations
-- **Advanced Mode (Full Control)**: manual selection, full metrics visibility, and tunable parameters
-""")
+# ==========================================================
+# ENTRY SCREEN — two choices drive all subsequent logic
+# ==========================================================
+if st.session_state.entry_path is None:
+    st.title("🧠 Quanteval — Model Evaluation")
+    st.markdown("""
+    **A comprehensive quantization benchmarking framework for PyTorch models.**
 
+    Choose how you want to explore:
+    """)
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("📚 **Learn about quantization**", use_container_width=True, key="entry_learn"):
+            st.session_state.entry_path = "learn"
+            st.rerun()
+        st.caption("Use built-in models to see how quantization affects accuracy, latency, and size. Guided, no setup.")
+    with col2:
+        if st.button("📤 **Upload your own model to explore quantization**", use_container_width=True, key="entry_upload"):
+            st.session_state.entry_path = "upload"
+            st.rerun()
+        st.caption("Upload a model; we analyze it and suggest comparisons to baselines or quantized variants.")
+    st.markdown("---")
+    st.info("💡 The **uploaded or selected model** determines what comparisons are performed automatically.")
+    st.stop()
+
+# Past entry screen: we have entry_path in ["learn", "upload"]
+entry_path = st.session_state.entry_path
 st.sidebar.header("⚙️ Evaluation Options")
+if st.sidebar.button("🏠 Back to start", key="back_to_start"):
+    st.session_state.entry_path = None
+    st.session_state.comparison_plan = None
+    for key in list(st.session_state.keys()):
+        if key.startswith("ib_") or key.startswith("entry_") or key == "comparison_plan" or key == "presentation_mode":
+            try:
+                del st.session_state[key]
+            except Exception:
+                pass
+    st.rerun()
 
-# ==========================================================
-# USER MODE SELECTION (CORE REQUIREMENT)
-# ==========================================================
-user_mode = st.sidebar.radio(
-    "👤 User Mode:",
-    ["Beginner Mode", "Advanced Mode"],
-    help="Beginner Mode provides guided, goal-driven benchmarking with explanations. Advanced Mode exposes full control."
-)
+# Utility: full session reset (helps clear stale widget IDs between code edits)
+if st.sidebar.button("⚠️ Clear UI session state (full reset)", key="clear_full_session"):
+    for k in list(st.session_state.keys()):
+        try:
+            del st.session_state[k]
+        except Exception:
+            pass
+    # Try the public rerun API, otherwise fall back to raising the internal RerunException.
+    try:
+        if hasattr(st, "experimental_rerun"):
+            st.experimental_rerun()
+        elif hasattr(st, "rerun"):
+            st.rerun()
+        else:
+            raise AttributeError("no rerun API on st")
+    except Exception:
+        try:
+            # Internal API used by Streamlit to trigger a rerun
+            from streamlit.runtime.scriptrunner.script_runner import RerunException
+            raise RerunException()
+        except Exception:
+            # Last resort: stop execution so the UI refreshes on the next interaction
+            st.stop()
 
-# We keep the existing evaluation flows, but route them through the two-mode UX.
-if user_mode == "Beginner Mode":
-    evaluation_mode = "Beginner"
-    beginner_goal = st.sidebar.radio(
-        "What do you want to do?",
-        [
-            "Learn how quantization affects models",
-            "Upload a model and understand its properties",
-            "Compare my uploaded model against a baseline",
-        ],
-        help="Beginner Mode hides unnecessary knobs and focuses on clear conclusions."
+# Path B only: presentation mode (Beginner vs Advanced)
+if entry_path == "upload":
+    user_mode = st.sidebar.radio(
+        "👤 Presentation:",
+        ["Beginner Mode", "Advanced Mode"],
+        help="Beginner: guided demo with explanations. Advanced: manual selection, raw metrics, multi-model comparison.",
+        key="presentation_radio",
     )
+    st.session_state.presentation_mode = "Beginner" if user_mode == "Beginner Mode" else "Advanced"
 else:
-    evaluation_mode = st.sidebar.radio(
-        "📊 Advanced Workflow:",
-        ["Single Model", "Compare Models", "Multi-Model (Advanced)"],
-        help="Full control benchmarking: upload/select multiple models and compare manually."
-    )
+    user_mode = "Beginner Mode"  # Path A is beginner-only
 
-# Internal routing: reuse existing flows without rewriting evaluation logic.
-internal_mode = "Intelligent Benchmarking" if evaluation_mode == "Beginner" else evaluation_mode
+# Routing: Path A (learn) vs Path B (upload). Advanced workflows only for Path B.
+internal_mode = None
+if entry_path == "learn":
+    internal_mode = "Path A: Learn"
+elif entry_path == "upload":
+    # Path B: user can choose Advanced workflows (Single/Compare/Multi) or stay in planner-driven flow
+    if user_mode == "Advanced Mode":
+        internal_mode = st.sidebar.radio(
+            "📊 Advanced Workflow:",
+            ["Planner-driven (upload)", "Compare to Built-in", "Multi-Model (Advanced)"],
+            help="Planner-driven uses analysis to pick comparisons; others are manual.",
+            key="advanced_workflow",
+        )
+        if internal_mode == "Planner-driven (upload)":
+            internal_mode = "Path B: Upload"
+        # else: Compare to Built-in, Multi-Model
+    else:
+        internal_mode = "Path B: Upload"
+
+# Defensive defaults so static analysers (Pylance) don't report undefined variables
+# These values are overwritten by specific UI branches when needed.
+device = torch.device("cpu")
+eval_samples = 200
+latency_runs = 20
+latency_warmup = 5
+model_type = None
+variant = None
 
 # ==========================================================
-# MODEL SELECTION / USER UPLOAD
+# MODEL SELECTION / USER UPLOAD (Advanced workflows only)
+# Path A (Learn) and Path B (Upload) use planner; no selection here.
 # ==========================================================
-if internal_mode == "Single Model":
-    use_generic_loader = False 
-    
-    model_source = st.sidebar.radio(
-        "Choose model source:",
-        ["Built-in Model", "Upload Custom Model"]
-    )
+if internal_mode == "Path A: Learn":
+    # No model selection in sidebar; plan_learn drives architecture + baseline + variants
+    use_generic_loader = False
+    model_key = None
+    user_model_path = None
+    baseline_key = None
+    quantized_key = None
+elif internal_mode == "Path B: Upload":
+    # Upload + planner; model selection is in Path B block
+    use_generic_loader = False
+    model_key = None
+    user_model_path = None
+    baseline_key = None
+    quantized_key = None
+elif internal_mode == "Single Model":
+    # Single Model option removed — planner-driven covers this flow
+    # Keep variables initialized to avoid NameError in other branches
+    use_generic_loader = False
+    model_key = None
+    user_model_path = None
+    baseline_key = None
+    quantized_key = None
 
-    if model_source == "Built-in Model":
-        model_type = st.sidebar.selectbox("Model Architecture", list(MODEL_REGISTRY.keys()))
-        variant = st.sidebar.selectbox("Variant", list(MODEL_REGISTRY[model_type].keys()))
-        model_key = MODEL_REGISTRY[model_type][variant]
-        user_model_path = None
-        baseline_key = None
-        quantized_key = None
 
-    else: #upload custom model
-        st.sidebar.write("Upload a `.pt` or `.pth` model file")
-        uploaded_file = st.sidebar.file_uploader("Upload model file", type=["pt", "pth"])
-        
-        # For generic models, we'll auto-detect the type
-        model_type = None
-        variant = "Custom Upload"
-        model_key = None
-        user_model_path = None
-        baseline_key = None
-        quantized_key = None
-        use_generic_loader = True
-
-        if uploaded_file:
-            os.makedirs("uploads", exist_ok=True)
-            temp_path = os.path.join("uploads", uploaded_file.name)
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.read())
-            user_model_path = temp_path
-
-elif internal_mode == "Compare Models":  # Compare Models mode
-    comparison_type = st.sidebar.radio(
-        "Comparison Type:",
-        ["Built-in vs Built-in", "Baseline vs Uploaded"]
-    )
-    
-    if comparison_type == "Built-in vs Built-in":
-        use_generic_loader = False
-        model_type = st.sidebar.selectbox("Model Architecture", list(MODEL_REGISTRY.keys()))
-        
-        variants = list(MODEL_REGISTRY[model_type].keys())
-        baseline_variant = st.sidebar.selectbox("Baseline Model", variants, index=0)
-        quantized_variant = st.sidebar.selectbox("Quantized Model", variants, index=1 if len(variants) > 1 else 0)
-        
-        baseline_key = MODEL_REGISTRY[model_type][baseline_variant]
-        quantized_key = MODEL_REGISTRY[model_type][quantized_variant]
-        model_key = None
-        user_model_path = None
-        variant = None
-        baseline_use_generic = False
-        quantized_use_generic = False
-        baseline_profile = None
-        quantized_profile = None
-    else:  # Baseline vs Uploaded
-        model_type = st.sidebar.selectbox("Baseline Model Architecture", list(MODEL_REGISTRY.keys()))
-        variants = list(MODEL_REGISTRY[model_type].keys())
-        baseline_variant = st.sidebar.selectbox("Baseline Model", variants, index=0)
-        baseline_key = MODEL_REGISTRY[model_type][baseline_variant]
-        baseline_use_generic = False
-        
-        st.sidebar.write("---")
-        st.sidebar.write("Upload model to compare:")
-        uploaded_file = st.sidebar.file_uploader("Upload model file", type=["pt", "pth"], key="compare_upload")
-        
-        quantized_key = None
-        quantized_variant = None
-        quantized_use_generic = True
-        user_model_path = None
-        quantized_profile = None
-        
-        if uploaded_file:
-            os.makedirs("uploads", exist_ok=True)
-            temp_path = os.path.join("uploads", uploaded_file.name)
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.read())
-            user_model_path = temp_path
-
-elif internal_mode == "Intelligent Benchmarking":
-    # Intelligent Benchmarking mode - skip model selection here
-    # All logic is handled in the execution section below
-    pass
-
-# ----------
-# Common settings (only for Single Model and Compare Models modes)
-# ----------
-if internal_mode in ["Single Model", "Compare Models", "Multi-Model (Advanced)"]:
-    device_choice = st.sidebar.selectbox("Run on", ["cpu", "cuda (if available)"])
-    device = torch.device("cuda" if (device_choice.startswith("cuda") and torch.cuda.is_available()) else "cpu")
-
-    eval_samples = st.sidebar.number_input("Num eval samples", min_value=32, max_value=5000, value=512, step=32)
-    latency_runs = st.sidebar.number_input("Latency runs", min_value=5, max_value=200, value=20)
-    latency_warmup = st.sidebar.number_input("Latency warmup", min_value=1, max_value=50, value=5)
-else:
-    # For Intelligent Benchmarking, these will be set in its own section
-    device = None
-    eval_samples = None
-    latency_runs = None
-    latency_warmup = None
 
 # ==========================================================
 # IMPORTED MODEL PROFILING DISPLAY
@@ -236,42 +226,101 @@ def display_model_profile(profile: ModelProfile):
     # Key metrics in columns
     col1, col2, col3, col4 = st.columns(4)
     
+    # Support passing either a ModelProfile instance or a plain dict (from session)
+    if hasattr(profile, 'to_dict'):
+        p_dict = profile.to_dict()
+        arch = getattr(profile, 'arch_type', p_dict.get('architecture_type', 'Unknown'))
+        params = getattr(profile, 'param_counts', {}).get('total', p_dict.get('total_parameters', 0))
+        size_mb = getattr(profile, 'size_fp32', {}).get('size_mb', p_dict.get('size_estimates', {}).get('fp32_mb', None))
+        depth = getattr(profile, 'depth', p_dict.get('model_depth', None))
+    elif isinstance(profile, dict):
+        p_dict = profile
+        arch = p_dict.get('architecture_type', 'Unknown')
+        params = p_dict.get('total_parameters', 0)
+        size_mb = p_dict.get('size_estimates', {}).get('fp32_mb', None)
+        depth = p_dict.get('model_depth', None)
+    else:
+        # Unknown profile type
+        arch = 'Unknown'
+        params = 0
+        size_mb = None
+        depth = None
+
     with col1:
-        st.metric("Architecture", profile.arch_type)
+        st.metric("Architecture", arch)
     with col2:
-        st.metric("Parameters", f"{profile.param_counts['total']:,}")
+        st.metric("Parameters", f"{params:,}")
     with col3:
-        st.metric("FP32 Size", f"{profile.size_fp32['size_mb']:.1f} MB")
+        st.metric("FP32 Size", f"{size_mb:.1f} MB" if size_mb is not None else "N/A")
     with col4:
-        st.metric("Model Depth", profile.depth)
+        st.metric("Model Depth", depth if depth is not None else "N/A")
     
     # Expandable detailed info
     with st.expander("📊 Detailed Profile Information"):
-        profile_dict = profile.to_dict()
-        
+        # Prefer the dict representation when available (p_dict set earlier), else fall back
+        profile_dict_local = None
+        try:
+            if 'p_dict' in locals() and p_dict is not None:
+                profile_dict_local = p_dict
+            elif hasattr(profile, 'to_dict'):
+                profile_dict_local = profile.to_dict()
+        except Exception:
+            profile_dict_local = None
+
         # Size estimates
         st.write("**Size Estimates:**")
-        size_df = pd.DataFrame([profile_dict['size_estimates']]).T
-        size_df.columns = ["Size (MB)"]
-        st.dataframe(size_df, width='stretch')
-        
+        size_estimates = None
+        if isinstance(profile_dict_local, dict):
+            size_estimates = profile_dict_local.get('size_estimates')
+        else:
+            size_estimates = getattr(profile, 'size_estimates', None)
+
+        if size_estimates:
+            try:
+                size_df = pd.DataFrame([size_estimates]).T
+                size_df.columns = ["Size (MB)"]
+                st.dataframe(size_df, width='stretch')
+            except Exception:
+                st.write(size_estimates)
+        else:
+            st.write("N/A")
+
         # Layer composition (top 10)
         st.write("**Layer Composition (Top 10):**")
-        layer_comp = dict(list(profile.layer_composition.items())[:10])
-        layer_df = pd.DataFrame(list(layer_comp.items()), columns=["Layer Type", "Count"])
-        st.dataframe(layer_df, width='stretch')
-        
+        layer_comp = None
+        if isinstance(profile_dict_local, dict):
+            layer_comp = profile_dict_local.get('layer_composition')
+        else:
+            layer_comp = getattr(profile, 'layer_composition', None)
+
+        if layer_comp:
+            try:
+                lc = dict(list(layer_comp.items())[:10])
+                layer_df = pd.DataFrame(list(lc.items()), columns=["Layer Type", "Count"])
+                st.dataframe(layer_df, width='stretch')
+            except Exception:
+                st.write(layer_comp)
+        else:
+            st.write("N/A")
+
         # I/O shapes
-        if profile.input_shapes:
+        input_shapes = profile_dict_local.get('input_shapes') if isinstance(profile_dict_local, dict) else getattr(profile, 'input_shapes', None)
+        output_shapes = profile_dict_local.get('output_shapes') if isinstance(profile_dict_local, dict) else getattr(profile, 'output_shapes', None)
+
+        if input_shapes:
             st.write("**Input Shapes:**")
-            st.json(profile.input_shapes)
-        if profile.output_shapes:
+            st.json(input_shapes)
+        if output_shapes:
             st.write("**Output Shapes:**")
-            st.json(profile.output_shapes)
-        
+            st.json(output_shapes)
+
         # FLOPs
-        if profile.flops:
-            st.write(f"**FLOPs:** {profile.flops:,.0f}")
+        flops_val = profile_dict_local.get('flops') if isinstance(profile_dict_local, dict) else getattr(profile, 'flops', None)
+        if flops_val:
+            try:
+                st.write(f"**FLOPs:** {flops_val:,.0f}")
+            except Exception:
+                st.write(f"**FLOPs:** {flops_val}")
 
 # ==========================================================
 # EVALUATION PIPELINES
@@ -303,6 +352,12 @@ def evaluate_cifar10_model(model, eval_samples, latency_runs, latency_warmup, de
 
     # peak_mem = peak_gpu_mem_once(model, imgs) if device.type == "cuda" else 0
     param_mb = param_bytes(model) / 1e6
+    # Fallback: some quantized models report zero-sized parameters; use state_dict on-disk size
+    if param_mb == 0:
+        try:
+            param_mb = on_disk_bytes_state_dict(model) / 1e6
+        except Exception:
+            pass
 
     return {
         "Accuracy": float(acc),
@@ -350,6 +405,12 @@ def evaluate_sst2_model(model, eval_samples, latency_runs, latency_warmup, devic
         device=str(device.type),
     )
     param_mb = param_bytes(model) / 1e6
+    # Fallback for quantized models
+    if param_mb == 0:
+        try:
+            param_mb = on_disk_bytes_state_dict(model) / 1e6
+        except Exception:
+            pass
 
     return {
         "Accuracy": float(acc),
@@ -637,27 +698,62 @@ def delete_saved_model(model_name: str):
 def display_model_metadata(metadata: ModelMetadata):
     """Display detected model metadata in the UI."""
     st.subheader("🔍 Detected Model Information")
-    
+
+    # Accept either a ModelMetadata instance or a plain dict (from session)
+    if hasattr(metadata, 'to_dict'):
+        m_dict = metadata.to_dict()
+        arch = metadata.architecture
+        task = metadata.task.value.replace("_", " ").title()
+        dataset = metadata.dataset.value.upper() if metadata.dataset.value != "unknown" else "Unknown"
+        precision = metadata.precision.value.upper()
+    elif isinstance(metadata, dict):
+        m_dict = metadata
+        arch = m_dict.get('architecture', 'Unknown')
+        task = m_dict.get('task', 'unknown').replace("_", " ").title()
+        dataset = m_dict.get('dataset', 'unknown').upper() if m_dict.get('dataset', 'unknown') != 'unknown' else 'Unknown'
+        precision = m_dict.get('precision', 'UNKNOWN').upper()
+    else:
+        m_dict = {}
+        arch = 'Unknown'
+        task = 'Unknown'
+        dataset = 'Unknown'
+        precision = 'UNKNOWN'
+
     col1, col2, col3, col4 = st.columns(4)
-    
+
     with col1:
-        st.metric("Architecture", metadata.architecture)
+        st.metric("Architecture", arch)
     with col2:
-        st.metric("Task", metadata.task.value.replace("_", " ").title())
+        st.metric("Task", task)
     with col3:
-        st.metric("Dataset", metadata.dataset.value.upper() if metadata.dataset.value != "unknown" else "Unknown")
+        st.metric("Dataset", dataset)
     with col4:
-        st.metric("Precision", metadata.precision.value.upper())
-    
+        st.metric("Precision", precision)
+
     # Quantization info
     with st.expander("📋 Detailed Metadata"):
-        metadata_dict = metadata.to_dict()
-        st.json(metadata_dict)
-        
-        if metadata.is_quantized():
-            st.info(f"✅ **Quantized Model Detected**: {metadata.quantization_method.value.upper()}")
-        elif metadata.is_baseline():
-            st.info("✅ **Baseline FP32 Model Detected**")
+        st.json(m_dict)
+        try:
+            # metadata may be a dict without helper methods
+            is_quant = False
+            is_base = False
+            if hasattr(metadata, 'is_quantized'):
+                is_quant = metadata.is_quantized()
+            elif isinstance(metadata, dict):
+                is_quant = metadata.get('quantization_method') not in (None, 'none', 'unknown')
+
+            if hasattr(metadata, 'is_baseline'):
+                is_base = metadata.is_baseline()
+            elif isinstance(metadata, dict):
+                is_base = metadata.get('precision') == 'fp32' and metadata.get('quantization_method') in (None, 'none')
+
+            if is_quant:
+                qname = m_dict.get('quantization_method', 'unknown').upper()
+                st.info(f"✅ **Quantized Model Detected**: {qname}")
+            elif is_base:
+                st.info("✅ **Baseline FP32 Model Detected**")
+        except Exception:
+            pass
 
 
 def get_evaluation_pipeline(metadata: ModelMetadata):
@@ -705,312 +801,164 @@ def evaluate_model_with_metadata(
         return evaluate_generic_model(model, profile, eval_samples, latency_runs, latency_warmup, device)
 
 
-# ==========================================================
-# RUN EVALUATION - Single Model
-# ==========================================================
-if internal_mode == "Single Model":
-    if st.button("Load Model"):
-        if use_generic_loader and not user_model_path:
-            st.error("Please upload a model file first.")
-            st.stop()
-        
-        # Load model
-        if use_generic_loader:
-            st.info(f"Loading custom model on {device.type.upper()}...")
-            model, load_info = load_generic_pytorch_model(user_model_path, str(device))
-            
-            if not load_info["success"]:
-                st.error(f"❌ Failed to load model: {load_info['error']}")
-                if load_info["warnings"]:
-                    for warning in load_info["warnings"]:
-                        st.warning(warning)
-                st.stop()
-            
-            st.success("✅ Model loaded successfully!")
-            
-            # Profile the model
-            st.info("Profiling model...")
-            profile = ModelProfile(model, str(device))
-            display_model_profile(profile)
-                
-            # Auto-detect model type for evaluation
-            model_type = profile.arch_type
-            
-        else:  # Built-in model
-            st.info(f"Loading {model_type} — {variant} on {device.type.upper()}...")
-            try:
-                model = load_model(model_key, device)
-                st.success("✅ Model loaded successfully.")
-                profile = None
-            except Exception as e:
-                st.error(f"Error loading model: {e}")
-                st.stop()
+# Single Model evaluation removed — planner-driven and Multi-Model cover needed workflows.
+# This block was intentionally removed to simplify the Advanced UX and avoid duplicate paths.
 
-        # Evaluate
-        st.info("Running evaluation...")
-        
-        # Determine which evaluation pipeline to use
-        if use_generic_loader:
-            # Check if we recognize the architecture
-            if "ResNet" in str(type(model)) or profile.arch_type == "CNN":
-                # Try CIFAR-10 evaluation
+    
+# Setup UI for compare-to-built-in: select baseline architecture/variant and upload one model
+if internal_mode == "Compare to Built-in":
+    model_type = st.sidebar.selectbox("Baseline Model Architecture", list(MODEL_REGISTRY.keys()), key="compare_upload_baseline_arch")
+    variants = list(MODEL_REGISTRY[model_type].keys())
+    baseline_variant = st.sidebar.selectbox("Baseline Model", variants, index=0, key="compare_upload_baseline_variant")
+    baseline_key = MODEL_REGISTRY[model_type][baseline_variant]
+
+    st.sidebar.write("---")
+    st.sidebar.write("Upload model to compare:")
+    uploaded_file = st.sidebar.file_uploader("Upload model file", type=["pt", "pth"], key="compare_upload")
+    user_model_path = None
+    if uploaded_file:
+        os.makedirs("uploads", exist_ok=True)
+        temp_path = os.path.join("uploads", uploaded_file.name)
+        with open(temp_path, "wb") as f:
+            f.write(uploaded_file.read())
+        user_model_path = temp_path
+        # Immediately profile uploaded model
+        try:
+            m, load_info = load_generic_pytorch_model(user_model_path, str(device))
+            if load_info.get("success"):
+                st.info("Profiling uploaded model...")
+                p = ModelProfile(m, str(device))
+                display_model_profile(p)
+                # keep in session for reuse
+                st.session_state.compare_uploaded_model = m
+                st.session_state.compare_uploaded_path = user_model_path
+                # persist profile so we can show it across reruns without recomputing
                 try:
-                    metrics = evaluate_cifar10_model(model, eval_samples, latency_runs, latency_warmup, device)
-                except Exception as e:
-                    st.warning(f"CIFAR-10 evaluation failed: {e}. Using generic evaluation.")
-                    metrics = evaluate_generic_model(model, profile, eval_samples, latency_runs, latency_warmup, device)
-            elif "DistilBert" in str(type(model)) or profile.arch_type == "Transformer":
-                # Try SST-2 evaluation
-                try:
-                    metrics = evaluate_sst2_model(model, eval_samples, latency_runs, latency_warmup, device)
-                except Exception as e:
-                    st.warning(f"SST-2 evaluation failed: {e}. Using generic evaluation.")
-                    metrics = evaluate_generic_model(model, profile, eval_samples, latency_runs, latency_warmup, device)
+                    st.session_state.compare_uploaded_profile = p.to_dict()
+                except Exception:
+                    st.session_state.compare_uploaded_profile = None
+            elif load_info.get("model_type") == "state_dict_only":
+                st.warning("Uploaded file appears to be a state-dict-only checkpoint (no architecture).")
+                st.info(f"Parameters (from checkpoint): {load_info.get('state_dict_param_count')}\nSize (MB): {load_info.get('state_dict_size_mb'):.2f}")
+                # Save load_info so we can explain to the user later; we cannot run inference.
+                st.session_state.compare_uploaded_path = user_model_path
+                st.session_state.compare_uploaded_load_info = load_info
+                # persist a minimal profile-like dict so UI can show the size/params
+                st.session_state.compare_uploaded_profile = {
+                    'architecture_type': 'Unknown',
+                    'total_parameters': load_info.get('state_dict_param_count', 0),
+                    'size_estimates': {'fp32_mb': load_info.get('state_dict_size_mb', 0.0)},
+                }
             else:
-                # Generic evaluation
-                metrics = evaluate_generic_model(model, profile, eval_samples, latency_runs, latency_warmup, device)
-        else:
-            # Built-in model - use known evaluation pipeline
-            if model_type == "ResNet18":
-                metrics = evaluate_cifar10_model(model, eval_samples, latency_runs, latency_warmup, device)
-            elif model_type == "DistilBERT":
-                metrics = evaluate_sst2_model(model, eval_samples, latency_runs, latency_warmup, device)
-            else:
-                st.error("Unsupported model architecture.")
-                st.stop()
+                st.warning(f"Upload loaded with warnings: {load_info.get('warnings')}")
+        except Exception as e:
+            st.warning(f"Failed to load uploaded model for profiling: {e}")
 
-        # Results
-        display_name = variant if not use_generic_loader else f"Custom {model_type}"
-        st.subheader(f"📊 Results: {display_name}")
-        
-        # Display metrics in columns
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            if metrics['Accuracy'] is not None:
-                st.metric("Accuracy", f"{metrics['Accuracy']*100:.2f}%")
-            else:
-                st.metric("Accuracy", "N/A")
-        with col2:
-            st.metric("Latency", f"{metrics['Latency (ms)']:.3f} ms")
-        with col3:
-            st.metric("Model Size", f"{metrics['param_MB']:.2f} MB")
-        with col4:
-            mem_key = "peak_memory_MB" if "peak_memory_MB" in metrics else "peak_mem_MB"
-            mem_val = metrics.get(mem_key, 0.0)
-            st.metric("Peak Memory", f"{mem_val:.2f} MB" if mem_val > 0 else "N/A")
-
-        # Create and display charts
-        charts = create_metrics_charts(metrics, display_name)
-        if charts is not None:
-            for chart in charts:
-                st.plotly_chart(chart, width='stretch')
-
-        # Detailed metrics table
-        st.subheader("Detailed Metrics")
-        metrics_df = pd.DataFrame([metrics]).T
-        metrics_df.columns = ["Value"]
-        st.dataframe(metrics_df, width='stretch')
-
-        # Log report
-        rec = log_experiment(
-            metrics,
-            model_name=display_name,
-            method="ui-eval",
-            out_dir="outputs/reports"
-        )
-        st.success("✅ Logged experiment to outputs/reports")
-
-# ==========================================================
-# COMPARE MODELS MODE
-# ==========================================================
-elif internal_mode == "Compare Models":  # Compare Models mode
     if st.button("Compare Models"):
-        # Validation
-        if comparison_type == "Built-in vs Built-in":
-            if baseline_key == quantized_key:
-                st.error("Please select different models for comparison.")
-                st.stop()
-        else:  # Baseline vs Uploaded
-            if not user_model_path:
-                st.error("Please upload a model file to compare.")
-                st.stop()
-        
-        results = {}
-        
-        # ========== LOAD AND EVALUATE BASELINE ==========
+        # Upload vs Built-in only
+        if not user_model_path and not st.session_state.get('compare_uploaded_path'):
+            st.error("Please upload a model file to compare.")
+            st.stop()
+        # Load baseline
         st.info(f"Loading baseline: {baseline_variant}...")
         try:
             baseline_model = load_model(baseline_key, device)
             st.success(f"✅ Baseline model loaded: {baseline_variant}")
-            baseline_profile = None
         except Exception as e:
             st.error(f"Error loading baseline model: {e}")
             st.stop()
-        
+
         st.info("Evaluating baseline model...")
-        if model_type == "ResNet18":
+        baseline_md = inspect_model_from_registry(baseline_key, baseline_model, str(device))
+        if baseline_md.architecture == "ResNet18":
             baseline_metrics = evaluate_cifar10_model(baseline_model, eval_samples, latency_runs, latency_warmup, device)
-        elif model_type == "DistilBERT":
+        elif baseline_md.architecture == "DistilBERT":
             baseline_metrics = evaluate_sst2_model(baseline_model, eval_samples, latency_runs, latency_warmup, device)
         else:
-            st.error("Unsupported model architecture.")
+            st.error("Unsupported baseline architecture.")
             st.stop()
-        
-        results["baseline"] = baseline_metrics
-        
-        # ========== LOAD AND EVALUATE COMPARISON MODEL ==========
-        if comparison_type == "Built-in vs Built-in":
-            # Built-in model
-            st.info(f"Loading comparison model: {quantized_variant}...")
-            try:
-                quantized_model = load_model(quantized_key, device)
-                st.success(f"✅ Comparison model loaded: {quantized_variant}")
-                quantized_profile = None
-            except Exception as e:
-                st.error(f"Error loading comparison model: {e}")
+
+        # Load uploaded model (reuse profiled if available)
+        if st.session_state.get('compare_uploaded_model'):
+            uploaded_model = st.session_state.compare_uploaded_model
+            uploaded_path = st.session_state.compare_uploaded_path
+            # if we have a stored profile dict, display it so it persists
+            if st.session_state.get('compare_uploaded_profile'):
+                display_model_profile(st.session_state.compare_uploaded_profile)
+        else:
+            # If earlier upload was a state-dict-only checkpoint we cannot run full benchmarking
+            if st.session_state.get('compare_uploaded_load_info') and st.session_state['compare_uploaded_load_info'].get('model_type') == 'state_dict_only':
+                st.error("Uploaded file is a state-dict-only checkpoint (no architecture). Full benchmarking (inference/latency) is not possible.")
+                st.info("Options: upload a scripted/traced model (.pt), provide the model code/architecture, or export the model with the architecture included.")
                 st.stop()
-            
-            st.info("Evaluating comparison model...")
-            if model_type == "ResNet18":
-                quantized_metrics = evaluate_cifar10_model(quantized_model, eval_samples, latency_runs, latency_warmup, device)
-            elif model_type == "DistilBERT":
-                quantized_metrics = evaluate_sst2_model(quantized_model, eval_samples, latency_runs, latency_warmup, device)
-            else:
-                st.error("Unsupported model architecture.")
+
+            uploaded_model, load_info = load_generic_pytorch_model(user_model_path, str(device))
+            if not load_info.get('success'):
+                st.error(f"Failed to load uploaded model: {load_info.get('error')}")
                 st.stop()
-            
-            comparison_name = quantized_variant
-            comparison_display_name = quantized_variant
-            
-        else:  # Baseline vs Uploaded
-            # Uploaded model
-            if not uploaded_file or not user_model_path:
-                st.error("Please upload a model file to compare.")
-                st.stop()
-            
-            st.info(f"Loading uploaded model: {uploaded_file.name}...")
-            model, load_info = load_generic_pytorch_model(user_model_path, str(device))
-            
-            if not load_info["success"]:
-                st.error(f"❌ Failed to load uploaded model: {load_info['error']}")
-                if load_info["warnings"]:
-                    for warning in load_info["warnings"]:
-                        st.warning(warning)
-                st.stop()
-            
-            st.success("✅ Uploaded model loaded successfully!")
-            
-            # Profile the uploaded model
-            st.info("Profiling uploaded model...")
-            quantized_profile = ModelProfile(model, str(device))
-            display_model_profile(quantized_profile)
-            
-            quantized_model = model
-            comparison_name = uploaded_file.name
-            comparison_display_name = f"Uploaded ({quantized_profile.arch_type})"
-            
-            st.info("Evaluating uploaded model...")
-            
-            # Auto-detect evaluation pipeline based on architecture
-            detected_type = quantized_profile.arch_type
-            if "ResNet" in str(type(model)) or detected_type == "CNN":
-                try:
-                    quantized_metrics = evaluate_cifar10_model(quantized_model, eval_samples, latency_runs, latency_warmup, device)
-                except Exception as e:
-                    st.warning(f"CIFAR-10 evaluation failed: {e}. Using generic evaluation.")
-                    quantized_metrics = evaluate_generic_model(quantized_model, quantized_profile, eval_samples, latency_runs, latency_warmup, device)
-            elif "DistilBert" in str(type(model)) or detected_type == "Transformer":
-                try:
-                    quantized_metrics = evaluate_sst2_model(quantized_model, eval_samples, latency_runs, latency_warmup, device)
-                except Exception as e:
-                    st.warning(f"SST-2 evaluation failed: {e}. Using generic evaluation.")
-                    quantized_metrics = evaluate_generic_model(quantized_model, quantized_profile, eval_samples, latency_runs, latency_warmup, device)
-            else:
-                quantized_metrics = evaluate_generic_model(quantized_model, quantized_profile, eval_samples, latency_runs, latency_warmup, device)
-        
-        results["quantized"] = quantized_metrics
-        
-        # ========== DISPLAY COMPARISON ==========
+
+        st.info("Evaluating uploaded model...")
+        uploaded_profile = ModelProfile(uploaded_model, str(device))
+        # Inspect uploaded model metadata so we can display detected info persistently
+        try:
+            uploaded_metadata = inspect_model(uploaded_model, source=ModelSource.USER, file_path=uploaded_path, device=str(device))
+            # persist metadata for reuse
+            st.session_state.compare_uploaded_metadata = uploaded_metadata.to_dict()
+        except Exception:
+            uploaded_metadata = None
+            st.session_state.compare_uploaded_metadata = None
+
+        display_model_profile(uploaded_profile)
+        if "ResNet" in uploaded_profile.arch_type:
+            uploaded_metrics = evaluate_cifar10_model(uploaded_model, eval_samples, latency_runs, latency_warmup, device)
+        elif "DistilBERT" in uploaded_profile.arch_type:
+            uploaded_metrics = evaluate_sst2_model(uploaded_model, eval_samples, latency_runs, latency_warmup, device)
+        else:
+            uploaded_metrics = evaluate_generic_model(uploaded_model, uploaded_profile, eval_samples, latency_runs, latency_warmup, device)
+
+        # Display results (reuse existing display code)
         baseline_display_name = f"{baseline_variant} (Baseline)"
+        comparison_display_name = f"Uploaded ({uploaded_profile.arch_type})"
         st.subheader(f"📊 Comparison: {baseline_display_name} vs {comparison_display_name}")
-        
-        # Side-by-side metrics
+        # Show detected metadata for baseline and uploaded models (persisted)
+        try:
+            col_md_1, col_md_2 = st.columns(2)
+            with col_md_1:
+                st.markdown("**Baseline detected metadata**")
+                display_model_metadata(baseline_md)
+            with col_md_2:
+                st.markdown("**Uploaded detected metadata**")
+                if uploaded_metadata:
+                    display_model_metadata(uploaded_metadata)
+                elif st.session_state.get('compare_uploaded_profile'):
+                    # show minimal persisted profile as metadata-like dict
+                    display_model_metadata(st.session_state.get('compare_uploaded_profile'))
+        except Exception:
+            pass
+
         col1, col2 = st.columns(2)
-        
         with col1:
             st.markdown(f"### {baseline_display_name}")
-            if baseline_metrics['Accuracy'] is not None:
+            if baseline_metrics.get('Accuracy') is not None:
                 st.metric("Accuracy", f"{baseline_metrics['Accuracy']*100:.2f}%")
             else:
                 st.metric("Accuracy", "N/A")
             st.metric("Latency", f"{baseline_metrics['Latency (ms)']:.3f} ms")
             st.metric("Model Size", f"{baseline_metrics['param_MB']:.2f} MB")
-        
         with col2:
             st.markdown(f"### {comparison_display_name}")
-            if quantized_metrics['Accuracy'] is not None:
-                st.metric("Accuracy", f"{quantized_metrics['Accuracy']*100:.2f}%")
+            if uploaded_metrics.get('Accuracy') is not None:
+                st.metric("Accuracy", f"{uploaded_metrics['Accuracy']*100:.2f}%")
             else:
                 st.metric("Accuracy", "N/A")
-            st.metric("Latency", f"{quantized_metrics['Latency (ms)']:.3f} ms")
-            st.metric("Model Size", f"{quantized_metrics['param_MB']:.2f} MB")
-        
-        # Improvement metrics (only if both have accuracy)
-        if baseline_metrics.get('Accuracy') is not None and quantized_metrics.get('Accuracy') is not None:
-            improvements = calculate_improvements(baseline_metrics, quantized_metrics)
-            
-            st.subheader("📈 Improvements")
-            imp_col1, imp_col2, imp_col3 = st.columns(3)
-            
-            if "Accuracy" in improvements:
-                with imp_col1:
-                    acc_imp = improvements["Accuracy"]
-                    delta = f"{acc_imp['relative']:+.2f}%"
-                    st.metric("Accuracy Change", f"{acc_imp['absolute']*100:+.2f}%", delta=delta)
-            
-            if "Latency" in improvements:
-                with imp_col2:
-                    lat_imp = improvements["Latency"]
-                    delta = f"{lat_imp['relative']:+.2f}%"
-                    st.metric("Latency Change", f"{lat_imp['absolute']:+.3f} ms", delta=delta)
-            
-            if "Model Size" in improvements:
-                with imp_col3:
-                    size_imp = improvements["Model Size"]
-                    delta = f"{size_imp['relative']:+.2f}%"
-                    st.metric("Size Reduction", f"{size_imp['absolute']:.2f} MB", delta=delta)
-        else:
-            st.info("⚠️ Accuracy comparison not available (one or both models don't have accuracy metrics)")
-        
-        # Comparison charts
-        charts = create_comparison_chart(baseline_metrics, quantized_metrics, baseline_display_name, comparison_display_name)
-        if charts is not None:
-            for chart in charts:
-                st.plotly_chart(chart, width='stretch')
-        
-        # Comparison table
-        st.subheader("Detailed Comparison")
-        comparison_df = pd.DataFrame({
-            baseline_display_name: baseline_metrics,
-            comparison_display_name: quantized_metrics
-        })
-        st.dataframe(comparison_df, width='stretch')
-        
-        # Log both experiments
-        log_experiment(
-            baseline_metrics,
-            model_name=f"{model_type}-{baseline_variant}",
-            method="ui-eval-comparison",
-            out_dir="outputs/reports"
-        )
-        log_experiment(
-            quantized_metrics,
-            model_name=f"{comparison_name}",
-            method="ui-eval-comparison",
-            out_dir="outputs/reports"
-        )
+            st.metric("Latency", f"{uploaded_metrics['Latency (ms)']:.3f} ms")
+            st.metric("Model Size", f"{uploaded_metrics['param_MB']:.2f} MB")
+
+        # Log
+        log_experiment(baseline_metrics, model_name=f"{model_type}-{baseline_variant}", method="ui-eval-comparison", out_dir="outputs/reports")
+        log_experiment(uploaded_metrics, model_name=f"uploaded-{os.path.basename(st.session_state.get('compare_uploaded_path', user_model_path))}", method="ui-eval-comparison", out_dir="outputs/reports")
         st.success("✅ Both experiments logged to outputs/reports")
+        
 
 # ==========================================================
 # MULTI-MODEL (ADVANCED) MODE
@@ -1018,7 +966,21 @@ elif internal_mode == "Compare Models":  # Compare Models mode
 elif internal_mode == "Multi-Model (Advanced)":
     st.header("🧪 Multi-Model Benchmarking (Advanced)")
     st.caption("Upload and benchmark multiple models, then compare them manually.")
+    # Persistent error list for this multi-model workflow so messages survive reruns
+    if "advanced_multi_errors" not in st.session_state:
+        st.session_state.advanced_multi_errors = []  # list of dicts: {name,timestamp,error,trace}
 
+    # If there are previously captured errors, show them prominently and persistently
+    if st.session_state.advanced_multi_errors:
+        with st.expander("⚠️ Recent errors (click to expand). These are persisted across reruns."):
+            for err in st.session_state.advanced_multi_errors:
+                ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(err.get('timestamp', 0)))
+                st.markdown(f"**{err.get('name','(unknown)')}** — {ts}")
+                st.error(err.get('error'))
+                st.code(err.get('trace',''), language='text')
+            if st.button("Clear displayed errors", key="advanced_multi_clear_errors"):
+                st.session_state.advanced_multi_errors = []
+                # don't rerun automatically; leave it to user
     init_saved_models()
     saved_models = get_saved_models()
 
@@ -1095,22 +1057,93 @@ elif internal_mode == "Multi-Model (Advanced)":
     if st.button("▶️ Run evaluation for model set", key="advanced_multi_eval"):
         from ui.model_detection import load_generic_pytorch_model
         from ui.model_inspection import inspect_model, ModelSource
-
         for name, info in model_set.items():
-            st.info(f"Loading {name}...")
-            model, load_info = load_generic_pytorch_model(info["path"], str(device))
-            if not load_info["success"]:
-                st.error(f"Failed to load {name}: {load_info['error']}")
+            try:
+                st.info(f"Loading {name}...")
+                model, load_info = load_generic_pytorch_model(info["path"], str(device))
+                # Handle state-dict-only checkpoints specially: we can record size/params but cannot run inference
+                if not load_info.get("success"):
+                    if load_info.get("model_type") == "state_dict_only":
+                        st.info(f"{name} appears to be a state-dict-only checkpoint. Recording size/param info.")
+                        info["metadata"] = {"architecture": "unknown", "note": "state_dict_only"}
+                        info["metrics"] = {
+                            "Accuracy": None,
+                            "Latency (ms)": None,
+                            "param_MB": load_info.get("state_dict_size_mb"),
+                            "param_count": load_info.get("state_dict_param_count"),
+                        }
+                        # Do not attempt to evaluate this model
+                        continue
+                    else:
+                        err_msg = load_info.get('error') or 'unknown load error'
+                        st.error(f"Failed to load {name}: {err_msg}")
+                        # persist the error across reruns
+                        st.session_state.advanced_multi_errors.append({
+                            "name": name,
+                            "timestamp": time.time(),
+                            "error": f"Load failed: {err_msg}",
+                            "trace": load_info.get('traceback') or ''
+                        })
+                        continue
+
+                try:
+                    metadata = inspect_model(model, source=ModelSource.USER, file_path=info["path"], device=str(device))
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    st.warning(f"Warning: inspection failed for {name}")
+                    st.session_state.advanced_multi_errors.append({
+                        "name": name,
+                        "timestamp": time.time(),
+                        "error": str(e),
+                        "trace": tb,
+                    })
+                    # keep going to evaluation attempt (some inspect failures are non-fatal)
+                    metadata = None
+
+                try:
+                    metrics = evaluate_model_with_metadata(model, metadata, eval_samples, latency_runs, latency_warmup, device)
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    st.error(f"Evaluation failed for {name}")
+                    # persist error details
+                    st.session_state.advanced_multi_errors.append({
+                        "name": name,
+                        "timestamp": time.time(),
+                        "error": str(e),
+                        "trace": tb,
+                    })
+                    # mark that this model attempted evaluation but failed
+                    info["metadata"] = (metadata.to_dict() if metadata is not None else None)
+                    info["metrics"] = None
+                    continue
+
+                # Success path for this model
+                info["metadata"] = (metadata.to_dict() if metadata is not None else None)
+                info["metrics"] = metrics
+                st.success(f"✅ {name} evaluation complete")
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                st.error(f"Unexpected error evaluating {name}")
+                st.session_state.advanced_multi_errors.append({
+                    "name": name,
+                    "timestamp": time.time(),
+                    "error": str(e),
+                    "trace": tb,
+                })
+                # continue with other models
                 continue
 
-            metadata = inspect_model(model, source=ModelSource.USER, file_path=info["path"], device=str(device))
-            metrics = evaluate_model_with_metadata(model, metadata, eval_samples, latency_runs, latency_warmup, device)
-
-            info["metadata"] = metadata.to_dict()
-            info["metrics"] = metrics
-
         st.success("Finished evaluating available models in the set.")
-        st.rerun()
+        # Refresh UI so metrics/metadata show, but keep errors persisted above
+        try:
+            st.experimental_rerun()
+        except Exception:
+            try:
+                raise st.experimental_rerun
+            except Exception:
+                # Last resort: do not crash; simply continue and let the user refresh
+                pass
 
     # Comparison UI (pairwise)
     evaluated = {n: i for n, i in model_set.items() if i.get("metrics")}
@@ -1142,81 +1175,349 @@ elif internal_mode == "Multi-Model (Advanced)":
         st.write(explanation)
 
 # ==========================================================
-# INTELLIGENT BENCHMARKING MODE
+# PATH A: LEARN ABOUT QUANTIZATION (built-in only, planner-driven)
 # ==========================================================
-elif internal_mode == "Intelligent Benchmarking":
-    if user_mode == "Beginner Mode":
-        st.header("🧠 Beginner Mode — Intelligent Benchmarking")
-        st.caption(f"Goal: {beginner_goal}")
-    else:
-        st.header("🧠 Intelligent Benchmarking")
+elif internal_mode == "Path A: Learn":
+    st.header("📚 Learn about quantization")
     st.markdown("""
-    <div style='background-color: #e8f4f8; padding: 15px; border-radius: 5px; margin-bottom: 20px;'>
-    <h4 style='margin-top: 0;'>✨ Perfect for Beginners</h4>
-    <p>This mode automatically detects your model type and suggests the best benchmarking workflow. 
-    No need to understand quantization methods or manually find baselines!</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown("""
-    **How it works:**
-    - **Workflow A**: Upload a quantized model → We automatically find and compare it to the baseline
-    - **Workflow B**: Upload a baseline model → We find all quantized variants and rank them by performance
-    
-    Just upload your model and let the system do the rest! 🚀
+    **System selects:** an FP32 baseline and quantized variants.
+    Compare them and inspect tradeoffs.
     """)
-
-    # Beginner goal: educational demo using built-in models (no upload required)
-    if user_mode == "Beginner Mode" and beginner_goal == "Learn how quantization affects models":
-        st.subheader("🎓 Guided demo (built-in examples)")
-        st.caption("Pick an example baseline and a quantized variant to see the tradeoffs, with plain-language conclusions.")
-
-        demo_arch = st.selectbox("Example architecture", list(MODEL_REGISTRY.keys()), key="beginner_demo_arch")
-        demo_variants = list(MODEL_REGISTRY[demo_arch].keys())
-        demo_base_variant = st.selectbox("Baseline", demo_variants, index=0, key="beginner_demo_base")
-        demo_quant_variant = st.selectbox(
-            "Quantized variant",
-            demo_variants,
-            index=1 if len(demo_variants) > 1 else 0,
-            key="beginner_demo_quant"
-        )
-
-        if st.button("▶️ Run demo comparison", key="beginner_demo_run"):
-            baseline_key = MODEL_REGISTRY[demo_arch][demo_base_variant]
-            quantized_key = MODEL_REGISTRY[demo_arch][demo_quant_variant]
-
-            st.info("Loading models...")
-            baseline_model = load_model(baseline_key, device)
-            quantized_model = load_model(quantized_key, device)
-
-            baseline_md = inspect_model_from_registry(baseline_key, baseline_model, str(device))
-            quant_md = inspect_model_from_registry(quantized_key, quantized_model, str(device))
-
-            st.info("Running evaluation...")
-            baseline_metrics = evaluate_model_with_metadata(baseline_model, baseline_md, eval_samples, latency_runs, latency_warmup, device)
-            quant_metrics = evaluate_model_with_metadata(quantized_model, quant_md, eval_samples, latency_runs, latency_warmup, device)
-
-            st.subheader("📊 Results")
-            headline, explanation = beginner_conclusion(
-                f"{demo_arch} — {demo_base_variant}",
-                f"{demo_arch} — {demo_quant_variant}",
-                baseline_metrics,
-                quant_metrics,
-            )
-            st.success(headline)
-            st.write(explanation)
-
-            st.dataframe(
-                pd.DataFrame(
-                    {
-                        f"{demo_base_variant}": baseline_metrics,
-                        f"{demo_quant_variant}": quant_metrics,
-                    }
-                ),
-                width='stretch',
-            )
-        st.write("---")
     
+    # Define evaluation settings for this mode
+    device = torch.device("cpu")
+    eval_samples = 200
+    latency_runs = 20
+    latency_warmup = 5
+    
+    architectures = get_builtin_architectures(MODEL_REGISTRY)
+    if not architectures:
+        st.warning("No built-in architectures available.")
+        st.stop()
+    
+    selected_arch = st.selectbox("Architecture:", architectures, key="learn_arch")
+    plan = plan_learn(MODEL_REGISTRY, selected_arch)
+    
+    st.info(plan.explanation)
+    
+    if not plan.can_compare:
+        st.warning(plan.analysis_only_message)
+        st.stop()
+    
+    if st.button("▶️ Run comparison (baseline + quantized)", key="learn_run"):
+        # Load baseline model
+        st.info("Loading baseline model...")
+        try:
+            baseline_model = load_model(plan.baseline_key, device)
+            st.success(f"✅ Loaded: {plan.baseline_key}")
+        except FileNotFoundError as e:
+            st.error(f"Could not load baseline model: {plan.baseline_key}")
+            st.error(str(e))
+            st.info("💡 **Solution**: Run the training script to generate this model file.")
+            if "resnet18" in plan.baseline_key.lower():
+                st.code("python scripts/train_cifar10.py", language="bash")
+            elif "distilbert" in plan.baseline_key.lower():
+                st.code("python scripts/train_sst2.py", language="bash")
+            with st.expander("📋 Full Error Details"):
+                st.exception(e)
+            st.stop()
+        except Exception as e:
+            st.error(f"Unexpected error loading baseline: {plan.baseline_key}")
+            with st.expander("📋 Error Details"):
+                st.exception(e)
+            st.stop()
+        
+        # Inspect baseline
+        baseline_md = inspect_model_from_registry(plan.baseline_key, baseline_model, str(device))
+        
+        # Evaluate baseline
+        st.info("Evaluating baseline model...")
+        try:
+            baseline_metrics = evaluate_model_with_metadata(
+                baseline_model, baseline_md, eval_samples, latency_runs, latency_warmup, device
+            )
+            st.success("✅ Baseline evaluation complete")
+        except Exception as e:
+            st.error("Failed to evaluate baseline model")
+            with st.expander("📋 Error Details"):
+                st.exception(e)
+            st.stop()
+        
+        # Load and evaluate variants
+        variant_results = []
+        progress_bar = st.progress(0)
+        
+        for idx, vk in enumerate(plan.variant_keys):
+            progress_bar.progress((idx + 1) / (len(plan.variant_keys) + 1))
+            
+            st.info(f"Loading variant {idx + 1}/{len(plan.variant_keys)}: {vk}")
+            try:
+                vm = load_model(vk, device)
+                vmd = inspect_model_from_registry(vk, vm, str(device))
+
+                # If the variant metadata lacks dataset/task info, inherit from baseline metadata
+                try:
+                    if getattr(vmd, 'dataset', None) and vmd.dataset.value == 'unknown':
+                        vmd.dataset = baseline_md.dataset
+                        vmd.task = baseline_md.task
+                        vmd.num_classes = baseline_md.num_classes
+                except Exception:
+                    pass
+
+                st.info(f"Evaluating {vk}...")
+                vmetrics = evaluate_model_with_metadata(
+                    vm, vmd, eval_samples, latency_runs, latency_warmup, device
+                )
+                
+                variant_results.append({
+                    "key": vk,
+                    "metadata": vmd,
+                    "metrics": vmetrics,
+                    "model": vm
+                })
+                st.success(f"✅ {vk} complete")
+                
+            except FileNotFoundError as e:
+                st.warning(f"⚠️ Could not load variant: {vk}")
+                st.info(f"This model file doesn't exist yet. You can generate it by running the appropriate quantization script.")
+                with st.expander(f"Error details for {vk}"):
+                    st.exception(e)
+                # Continue with other variants
+                continue
+            except Exception as e:
+                st.warning(f"⚠️ Error with variant: {vk}")
+                with st.expander(f"Error details for {vk}"):
+                    st.exception(e)
+                # Continue with other variants
+                continue
+        
+        progress_bar.empty()
+        
+        #
+        # Check if we have any variants to compare
+        if not variant_results:
+            st.warning("⚠️ No local quantized variants found for this architecture.")
+
+            # Suggest generating local quantized models
+            st.info("You can generate quantized variants locally:")
+            if "resnet18" in selected_arch.lower():
+                st.code("python scripts/quantize_cifar10_ptq.py", language="bash")
+                st.code("python scripts/train_cifar10_qat.py", language="bash")
+            elif "distilbert" in selected_arch.lower():
+                st.code("python scripts/quantize_sst2_dynamic.py", language="bash")
+
+            # 🌐 NEW: Online model fallback
+            try:
+                from ui.hf_search import search_hf_models
+                from ui.model_loader import load_hf_model_by_name
+            except Exception as e:
+                search_hf_models = None
+                load_hf_model_by_name = None
+                st.warning("Hugging Face search/load utilities unavailable (missing dependencies).")
+
+            st.divider()
+            st.subheader("🌐 Find similar models online (Hugging Face)")
+
+            candidates = []
+            if search_hf_models is not None:
+                try:
+                    candidates = search_hf_models(selected_arch)
+                except Exception as e:
+                    st.warning(f"Hugging Face search failed: {e}")
+
+            # If no candidates found, run debug search and show diagnostics
+            if not candidates and search_hf_models is not None:
+                try:
+                    from ui.hf_search import search_hf_models_debug
+                    dbg_results, dbg_info = search_hf_models_debug(selected_arch)
+                    # show debug info to the user to help diagnose
+                    with st.expander("Debug: Hugging Face search diagnostics"):
+                        st.write({"queries_tried": dbg_info})
+                    # offer debug results if any
+                    if dbg_results:
+                        candidates = dbg_results
+                except Exception:
+                    pass
+
+            if candidates:
+                # Ensure we have metadata to evaluate against (fall back to session state)
+                metadata = locals().get('metadata') or st.session_state.get('ib_metadata') or st.session_state.get('compare_uploaded_metadata') or None
+                if metadata is None:
+                    st.error("Model metadata not available for comparison. Run the initial analysis first.")
+                    st.stop()
+                chosen_model = st.selectbox("Select a model to compare:", candidates)
+
+                if st.button("Load online model and compare"):
+                    if load_hf_model_by_name is None:
+                        st.error("Cannot load Hugging Face models: loader not available.")
+                    else:
+                        with st.spinner(f"Loading {chosen_model}..."):
+                            try:
+                                hf_model = load_hf_model_by_name(chosen_model, device)
+                                st.success(f"Loaded online model: {chosen_model}")
+                                # Add it as a variant (simple representation)
+                                variant_results.append({
+                                    "metadata": metadata,
+                                    "metrics": evaluate_model_with_metadata(hf_model, metadata, eval_samples, latency_runs, latency_warmup, device),
+                                    "model": hf_model,
+                                    "source": "huggingface",
+                                    "name": chosen_model,
+                                })
+                            except Exception as e:
+                                st.error(f"Failed to load Hugging Face model: {e}")
+            else:
+                st.info("No similar models found online.")
+
+            # --- Help / Options & Next Steps (placed under HF search) ---
+            st.markdown("---")
+            st.subheader("Options to continue")
+            st.write("You can: 1) Upload a baseline/variant manually, 2) Generate quantized variants locally, or 3) Re-run Hugging Face search with diagnostics.")
+
+            with st.expander("1) Upload a baseline or quantized variant manually", expanded=False):
+                st.write("Upload a PyTorch checkpoint (.pt/.pth/.safetensors) or an ONNX file (.onnx) to compare.")
+                uploaded_main = st.file_uploader("Upload model file", type=["pt", "pth", "safetensors", "onnx"], key="upload_variant_bottom")
+                if uploaded_main is not None:
+                    tmpdir = os.path.join(".", "uploads")
+                    os.makedirs(tmpdir, exist_ok=True)
+                    out_path = os.path.join(tmpdir, uploaded_main.name)
+                    with open(out_path, "wb") as f:
+                        f.write(uploaded_main.getbuffer())
+                    st.success(f"Saved uploaded model to {out_path}. You can now use the Compare flow to load it as a variant.")
+
+            with st.expander("2) Generate quantized variants locally", expanded=False):
+                st.write("Run these scripts to create PTQ/QAT variants locally:")
+                try:
+                    if "resnet18" in selected_arch.lower():
+                        st.code("python scripts/quantize_cifar10_ptq.py", language="bash")
+                        st.code("python scripts/train_cifar10_qat.py", language="bash")
+                    elif "distilbert" in selected_arch.lower():
+                        st.code("python scripts/quantize_sst2_dynamic.py", language="bash")
+                except Exception:
+                    st.write("Select an architecture to see suggested scripts.")
+                st.info("After generating variants, re-run this comparison to see them listed.")
+
+            with st.expander("3) Re-run Hugging Face search with diagnostics", expanded=False):
+                st.write("Run the HF debug search to see per-query diagnostics and samples.")
+                if st.button("Run HF debug search", key="hf_debug_bottom"):
+                    try:
+                        from ui.hf_search import search_hf_models_debug
+                        dbg_results, dbg_info = search_hf_models_debug(selected_arch)
+                        st.write({"queries_tried": dbg_info})
+                        if dbg_results:
+                            st.success("Debug search found candidates — re-run the comparison to surface them.")
+                            st.write(dbg_results)
+                    except Exception as e:
+                        st.error(f"HF debug search failed: {e}")
+
+            # If still nothing to compare, stop
+            if not variant_results:
+                st.stop()
+        #
+        
+        # Display results
+        st.subheader("📊 Results")
+        
+        # Create comparison table
+        comparison_data = {
+            "Model": ["Baseline (FP32)"] + [
+                v["metadata"].quantization_method.value.upper() for v in variant_results
+            ]
+        }
+        
+        if baseline_metrics.get('Accuracy') is not None:
+            comparison_data["Accuracy (%)"] = [baseline_metrics['Accuracy'] * 100] + [
+                v['metrics'].get('Accuracy', 0) * 100 if v['metrics'].get('Accuracy') else None
+                for v in variant_results
+            ]
+        
+        comparison_data["Latency (ms)"] = [baseline_metrics['Latency (ms)']] + [
+            v['metrics']['Latency (ms)'] for v in variant_results
+        ]
+        
+        comparison_data["Size (MB)"] = [baseline_metrics['param_MB']] + [
+            v['metrics']['param_MB'] for v in variant_results
+        ]
+        
+        comparison_df = pd.DataFrame(comparison_data)
+        st.dataframe(comparison_df, use_container_width=True)
+        
+        # Explanations (required for Beginner Mode)
+        st.subheader("🧾 Explanation")
+        
+        for v in variant_results:
+            variant_name = v["metadata"].quantization_method.value.upper()
+            headline, expl = beginner_conclusion(
+                "Baseline (FP32)",
+                variant_name,
+                baseline_metrics,
+                v["metrics"]
+            )
+            st.success(f"**{variant_name}**: {headline}")
+            st.write(expl)
+            st.markdown("---")
+        
+        # Summary recommendation
+        st.subheader("💡 Overall Recommendation")
+        if variant_results:
+            # Find best variant using weighted score across accuracy, latency, and size.
+            # We compute normalized ratios (higher is better):
+            #  - accuracy_ratio = variant_acc / baseline_acc (if available)
+            #  - latency_ratio = baseline_latency / variant_latency
+            #  - size_ratio = baseline_size_MB / variant_size_MB
+            # Final score = w_acc*accuracy_ratio + w_lat*latency_ratio + w_size*size_ratio
+            # Default weights: accuracy 0.5, latency 0.3, size 0.2
+            def variant_score(v, w_acc=0.5, w_lat=0.3, w_size=0.2):
+                vm = v['metrics']
+                # Accuracy ratio
+                try:
+                    if baseline_metrics.get('Accuracy') and vm.get('Accuracy') is not None:
+                        acc_ratio = vm['Accuracy'] / baseline_metrics['Accuracy']
+                    else:
+                        acc_ratio = 0.5
+                except Exception:
+                    acc_ratio = 0.5
+
+                # Latency ratio (higher means faster vs baseline)
+                try:
+                    lat_ratio = baseline_metrics['Latency (ms)'] / vm['Latency (ms)']
+                except Exception:
+                    lat_ratio = 1.0
+
+                # Size ratio (higher means smaller variant)
+                try:
+                    size_ratio = baseline_metrics['param_MB'] / vm['param_MB']
+                except Exception:
+                    size_ratio = 1.0
+
+                # Guard against zero/inf
+                if not (isinstance(acc_ratio, (int, float)) and acc_ratio == acc_ratio):
+                    acc_ratio = 0.5
+                if not (isinstance(lat_ratio, (int, float)) and lat_ratio == lat_ratio):
+                    lat_ratio = 1.0
+                if not (isinstance(size_ratio, (int, float)) and size_ratio == size_ratio):
+                    size_ratio = 1.0
+
+                return w_acc * acc_ratio + w_lat * lat_ratio + w_size * size_ratio
+
+            best_variant = max(variant_results, key=lambda x: variant_score(x))
+            score_val = variant_score(best_variant)
+            st.success(
+                f"**Recommended for deployment**: {best_variant['metadata'].quantization_method.value.upper()} "
+                f"(score={score_val:.3f}) — best combined accuracy/latency/size tradeoff."
+            )
+
+# ==========================================================
+# PATH B: UPLOAD YOUR OWN MODEL (planner-driven comparison)
+# ==========================================================
+elif internal_mode == "Path B: Upload":
+    st.header("📤 Upload your own model to explore quantization")
+    st.markdown("""
+    We **analyze** your model (architecture, task, precision) and **infer comparison intent**:  
+    - If quantized → compare to FP32 baseline if available  
+    - If FP32 → compare to known quantized variants  
+    - If no match → analysis-only with explanation  
+    Then choose **Beginner** (guided + explanations) or **Advanced** (raw metrics, multi-model).
+    """)
     # Initialize saved models
     init_saved_models()
     
@@ -1405,7 +1706,25 @@ elif internal_mode == "Intelligent Benchmarking":
         initial_metrics = evaluate_model_with_metadata(
             model, metadata, eval_samples, latency_runs, latency_warmup, device
         )
-        
+        # Build analysis result and run comparison planner (shared logic)
+        try:
+            profile = ModelProfile(model, str(device))
+            param_count = profile.param_counts["total"]
+            size_mb = profile.size_fp32["size_mb"]
+        except Exception:
+            profile = None
+            param_count = sum(p.numel() for p in model.parameters())
+            size_mb = (param_count * 4) / (1024 * 1024)
+        analysis = ModelAnalysisResult(
+            metadata=metadata,
+            profile=profile,
+            param_count=param_count,
+            size_mb=size_mb,
+            load_success=True,
+            model=model,
+        )
+        plan = plan_upload(analysis)
+        st.session_state.comparison_plan = plan
         # Store in session state
         st.session_state.ib_analysis_complete = True
         st.session_state.ib_model = model
@@ -1417,7 +1736,6 @@ elif internal_mode == "Intelligent Benchmarking":
             st.session_state.ib_uploaded_filename = uploaded_file.name
         else:
             st.session_state.ib_uploaded_filename = selected_saved if use_saved_model else None
-        
         st.rerun()
     
     # Display saved model option (outside analyze block, but only if analysis is complete)
@@ -1444,6 +1762,12 @@ elif internal_mode == "Intelligent Benchmarking":
         model = st.session_state.ib_model
         metadata = st.session_state.ib_metadata
         initial_metrics = st.session_state.ib_initial_metrics
+        orchestrator = get_comparison_orchestrator()  # for manual fallback buttons
+        # Always show detected metadata so it remains visible after evaluation
+        try:
+            display_model_metadata(metadata)
+        except Exception:
+            pass
         
         # Display initial evaluation results
         st.subheader("📊 Initial Evaluation Results")
@@ -1459,37 +1783,140 @@ elif internal_mode == "Intelligent Benchmarking":
         
         st.write("---")
 
-        # Beginner goal: analysis-only (no comparison required)
-        if user_mode == "Beginner Mode" and beginner_goal == "Upload a model and understand its properties":
+        
+
+        # Show comparison plan (system-driven; same logic for Beginner and Advanced)
+        plan = st.session_state.get("comparison_plan")
+        if not plan:
+            st.warning("Comparison plan not set. Re-run Analyze Model.")
+            st.stop()
+        st.subheader("📋 Comparison plan")
+        st.info(plan.explanation)
+        if not plan.can_compare:
+            st.warning(plan.analysis_only_reason or "No comparison available.")
             st.subheader("🧾 What these results mean")
             if initial_metrics.get("Accuracy") is None:
                 st.info(
-                    "Accuracy is not available for this model in the current pipeline (this usually means we couldn't confidently match it to a known dataset/task). "
-                    "Latency, memory/size, and architecture detection are still useful for understanding deployment tradeoffs."
+                    "Accuracy is not available for this model in the current pipeline. "
+                    "Latency, memory/size, and architecture detection are still useful."
                 )
             else:
                 st.write(
-                    "Accuracy tells you how often the model is correct on the evaluation dataset. "
-                    "Latency (ms) is inference time per example, and Model Size is derived from parameter storage."
+                    "Accuracy tells you how often the model is correct. "
+                    "Latency (ms) is inference time per example; Model Size is from parameter storage."
                 )
-            st.success("**Conclusion:** Your model has been analyzed successfully. Use the other Beginner goals to compare it against a baseline.")
+            st.success("**Conclusion:** Your model has been analyzed. No built-in baseline/variants for comparison.")
+
+            # Offer alternatives including Hugging Face search for online variants
+            st.write("---")
+            st.subheader("Options to continue")
+            st.write("You can: 1) Upload a baseline/variant manually, 2) Generate quantized variants locally, or 3) Search Hugging Face for similar models.")
+
+            # Local generation helper
+            with st.expander("🛠️ Generate quantized variants locally"):
+                if "resnet" in metadata.architecture.lower():
+                    st.code("python scripts/quantize_cifar10_ptq.py", language="bash")
+                    st.code("python scripts/train_cifar10_qat.py", language="bash")
+                elif "distilbert" in metadata.architecture.lower():
+                    st.code("python scripts/quantize_sst2_dynamic.py", language="bash")
+
+            # Hugging Face fallback
+            try:
+                from ui.hf_search import search_hf_models
+                from ui.model_loader import load_hf_model_by_name
+            except Exception:
+                search_hf_models = None
+                load_hf_model_by_name = None
+
+            if search_hf_models is None:
+                st.info("Hugging Face search unavailable (missing dependencies).")
+                st.stop()
+
+            st.subheader("🌐 Search Hugging Face for similar models")
+            try:
+                hf_candidates = search_hf_models(metadata.architecture)
+            except Exception as e:
+                st.error(f"Hugging Face search failed: {e}")
+                st.stop()
+
+            # --- Help / Options & Next Steps (always visible under HF search) ---
+            st.markdown("---")
+            st.subheader("Options to continue")
+            st.write("You can: 1) Upload a baseline/variant manually, 2) Generate quantized variants locally, or 3) Re-run Hugging Face search with diagnostics.")
+
+            with st.expander("1) Upload a baseline or quantized variant manually", expanded=False):
+                st.write("Upload a PyTorch checkpoint (.pt/.pth/.safetensors) or an ONNX file (.onnx) to compare.")
+                uploaded_hf_help = st.file_uploader("Upload model file", type=["pt", "pth", "safetensors", "onnx"], key="upload_variant_hf_help")
+                if uploaded_hf_help is not None:
+                    tmpdir = os.path.join(".", "uploads")
+                    os.makedirs(tmpdir, exist_ok=True)
+                    out_path = os.path.join(tmpdir, uploaded_hf_help.name)
+                    with open(out_path, "wb") as f:
+                        f.write(uploaded_hf_help.getbuffer())
+                    st.success(f"Saved uploaded model to {out_path}. You can now use the Compare flow to load it as a variant.")
+
+            with st.expander("2) Generate quantized variants locally", expanded=False):
+                st.write("Run these scripts to create PTQ/QAT variants locally:")
+                try:
+                    if "resnet" in metadata.architecture.lower():
+                        st.code("python scripts/quantize_cifar10_ptq.py", language="bash")
+                        st.code("python scripts/train_cifar10_qat.py", language="bash")
+                    elif "distilbert" in metadata.architecture.lower():
+                        st.code("python scripts/quantize_sst2_dynamic.py", language="bash")
+                except Exception:
+                    st.write("Select an architecture to see suggested scripts.")
+                st.info("After generating variants, re-run this comparison to see them listed.")
+
+            with st.expander("3) Re-run Hugging Face search with diagnostics", expanded=False):
+                st.write("Run the HF debug search to see per-query diagnostics and samples.")
+                if st.button("Run HF debug search", key="hf_debug_under_search"):
+                    try:
+                        from ui.hf_search import search_hf_models_debug
+                        dbg_results, dbg_info = search_hf_models_debug(metadata.architecture)
+                        st.write({"queries_tried": dbg_info})
+                        if dbg_results:
+                            st.success("Debug search found candidates — refresh to surface them.")
+                            st.write(dbg_results)
+                    except Exception as e:
+                        st.error(f"HF debug search failed: {e}")
+
+            if not hf_candidates:
+                st.info("No similar models found on Hugging Face.")
+                st.stop()
+
+            selected_hf = st.selectbox("Select an online model to compare:", hf_candidates, key="hf_search_fallback_select")
+            if st.button("Load and evaluate online model", key="hf_search_fallback_load"):
+                if load_hf_model_by_name is None:
+                    st.error("Cannot load Hugging Face models: loader not available.")
+                else:
+                    with st.spinner(f"Loading {selected_hf} from Hugging Face..."):
+                        try:
+                            hf_model = load_hf_model_by_name(selected_hf, device)
+                            st.success(f"Loaded online model: {selected_hf}")
+                            hf_metrics = evaluate_model_with_metadata(hf_model, metadata, eval_samples, latency_runs, latency_warmup, device)
+                            st.subheader("📊 Online model results")
+                            st.metric("Latency", f"{hf_metrics.get('Latency (ms)', 'N/A')}")
+                            st.metric("Model Size", f"{hf_metrics.get('param_MB', 'N/A')}")
+                            if hf_metrics.get('Accuracy') is not None:
+                                st.metric("Accuracy", f"{hf_metrics['Accuracy']*100:.2f}%")
+                        except Exception as e:
+                            st.error(f"Failed to load/evaluate Hugging Face model: {e}")
+            # After offering these options, stop further automatic plan handling
             st.stop()
         
-        # NOW determine workflow and show comparison options AFTER evaluation
-        orchestrator = get_comparison_orchestrator()
-        workflow = orchestrator.determine_workflow(metadata)
-        
-        if workflow == OrchestratorWorkflowType.QUANTIZED_TO_BASELINE:
-            st.subheader("📊 Workflow A: Quantized Model → Compare to Baseline")
-            st.markdown("""
-            <div style='background-color: #e3f2fd; padding: 15px; border-radius: 5px; border-left: 4px solid #2196F3; margin-bottom: 20px;'>
-            <p style='color: #1565C0; margin: 0;'><strong>Detected:</strong> You uploaded a quantized model. We'll find the matching baseline 
-            and compare them side-by-side.</p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Find baseline
-            baseline_result = orchestrator.find_baseline_for_quantized(metadata, str(device))
+        # Use plan intent (shared backend logic)
+        from ui.comparison_planner import ComparisonIntent
+        if plan.intent == ComparisonIntent.COMPARE_QUANTIZED_TO_BASELINE:
+            st.subheader("📊 Quantized model → Compare to baseline")
+            # Load baseline from plan (no duplicate lookup)
+            baseline_result = None
+            if plan.baseline_key:
+                try:
+                    baseline_model = load_model(plan.baseline_key, device)
+                    baseline_metadata = inspect_model_from_registry(plan.baseline_key, baseline_model, str(device))
+                    baseline_result = (baseline_metadata, baseline_model)
+                except Exception as e:
+                    st.warning(f"Could not load baseline: {e}")
             
             if not baseline_result:
                 st.warning("⚠️ No baseline found for this model.")
@@ -1501,7 +1928,7 @@ elif internal_mode == "Intelligent Benchmarking":
                 """)
 
                 # Beginner Mode: try to recommend a similar uploaded model if available
-                if user_mode == "Beginner Mode" and beginner_goal == "Compare my uploaded model against a baseline":
+                if user_mode == "Beginner Mode":
                     rec = recommend_comparison_target(metadata, saved_models=saved_models)
                     if rec.mode == "uploaded_similar" and rec.uploaded_model_name:
                         st.info(f"Suggested comparison: **{rec.uploaded_model_name}** (similar uploaded model).")
@@ -1821,210 +2248,109 @@ elif internal_mode == "Intelligent Benchmarking":
                             key="download_json_baseline"
                         )
         
-        elif workflow == OrchestratorWorkflowType.BASELINE_TO_QUANTIZED:
-            st.subheader("📊 Workflow B: Baseline Model → Find Best Quantization")
-            st.success("✅ **Detected**: You uploaded a baseline FP32 model!")
-            st.markdown("""
-            <div style='background-color: #e8f5e9; padding: 15px; border-radius: 5px; border-left: 4px solid #4CAF50; margin-bottom: 20px;'>
-            <p style='color: #2e7d32; margin: 0;'>We'll automatically find all available quantized variants and rank them by performance.
-            This will help you choose the best quantization strategy for your model.</p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Find quantized variants
-            variants = orchestrator.find_quantized_variants(metadata, str(device))
+        elif plan.intent == ComparisonIntent.COMPARE_BASELINE_TO_VARIANTS:
+            st.subheader("📊 Baseline model → Compare to quantized variants")
+            st.success("✅ **Detected**: You uploaded a baseline FP32 model.")
+            # Load variants from plan (no duplicate lookup)
+            variants = []
+            for vk in plan.variant_keys:
+                try:
+                    vm = load_model(vk, device)
+                    vmd = inspect_model_from_registry(vk, vm, str(device))
+                    if vmd.is_quantized() and vmd.is_compatible_with(metadata):
+                        variants.append((vmd, vm))
+                except Exception:
+                    continue
+                
+            #check if variants found
             
             if not variants:
                 st.warning("⚠️ No quantized variants found for this baseline.")
                 st.write("""
                 **Options:**
-                1. Generate quantized variants using the quantization scripts
-                2. Continue with single model evaluation
+                1. Generate quantized variants locally
+                2. Search for similar quantized models online (Hugging Face)
+                3. Continue with single model evaluation
                 """)
-                
-                # Option to find quantized variants
-                # Check if comparison already done
-                if st.session_state.ib_comparison_results and st.session_state.ib_comparison_type == "variants_comparison":
-                    # Display stored comparison
-                    baseline_metrics = st.session_state.ib_comparison_results["baseline_metrics"]
-                    variant_results = st.session_state.ib_comparison_results["variant_results"]
-                    
-                    st.subheader("📊 Quantization Strategy Comparison")
-                else:
-                    st.markdown("**Would you like to find and compare quantized variants?**")
-                    if st.button("🔍 Find Quantized Variants", key="find_variants_manual"):
-                        # Try to find variants again
-                        variants = orchestrator.find_quantized_variants(metadata, str(device))
-                        if variants:
-                            st.success(f"✅ Found {len(variants)} quantized variant(s)")
-                            
-                            # Evaluate all variants
-                            variant_results = []
-                            progress_bar = st.progress(0)
-                            
-                            for i, (variant_metadata, variant_model) in enumerate(variants):
-                                progress_bar.progress((i + 1) / (len(variants) + 1))
-                                st.info(f"Evaluating variant {i+1}/{len(variants)}: {variant_metadata.quantization_method.value}")
-                                
-                                variant_metrics = evaluate_model_with_metadata(
-                                    variant_model, variant_metadata, eval_samples, latency_runs, latency_warmup, device
-                                )
-                                
-                                variant_results.append({
-                                    "metadata": variant_metadata,
-                                    "metrics": variant_metrics,
-                                    "model": variant_model
-                                })
-                            
-                            progress_bar.empty()
-                            
-                            # Use already evaluated baseline metrics
-                            baseline_metrics = initial_metrics
-                            
-                            # Store in session state
-                            st.session_state.ib_comparison_results = {
-                                "baseline_metrics": baseline_metrics,
-                                "variant_results": variant_results,
-                                "baseline_metadata": metadata
-                            }
-                            st.session_state.ib_comparison_type = "variants_comparison"
-                            st.rerun()
+
+                # ----------------------------
+                # Option A — local scripts
+                # ----------------------------
+                with st.expander("🛠️ Generate quantized variants locally"):
+                    if "resnet" in metadata.architecture.lower():
+                        st.code("python scripts/quantize_cifar10_ptq.py", language="bash")
+                        st.code("python scripts/train_cifar10_qat.py", language="bash")
+                    elif "distilbert" in metadata.architecture.lower():
+                        st.code("python scripts/quantize_sst2_dynamic.py", language="bash")
+
+                # ----------------------------
+                # Option B — Hugging Face search (NEW)
+                # ----------------------------
+                st.subheader("🌐 Find quantized variants online")
+
+                try:
+                    from ui.hf_search import search_hf_models
+                    from ui.model_loader import load_hf_model_by_name
+                except Exception:
+                    search_hf_models = None
+                    load_hf_model_by_name = None
+                    st.warning("Hugging Face integration unavailable (missing dependencies).")
+
+                hf_candidates = []
+                if search_hf_models is not None:
+                    try:
+                        hf_candidates = search_hf_models(metadata.architecture)
+                    except Exception as e:
+                        st.warning(f"Hugging Face search failed: {e}")
+
+                if hf_candidates:
+                    selected_hf = st.selectbox(
+                        "Select an online model to compare:",
+                        hf_candidates,
+                        key="hf_variant_select"
+                    )
+
+                    if st.button("⚡ Load and Compare Online Model", key="load_hf_variant"):
+                        if load_hf_model_by_name is None:
+                            st.error("Cannot load Hugging Face models: loader not available.")
                         else:
-                            st.error("❌ Could not find quantized variants for comparison.")
-                            st.stop()
-                    
-                    # If no comparison yet, stop here
-                    if not st.session_state.ib_comparison_results:
-                        st.stop()
-                    
-                    # Get stored results
-                    baseline_metrics = st.session_state.ib_comparison_results["baseline_metrics"]
-                    variant_results = st.session_state.ib_comparison_results["variant_results"]
-                    
-                    st.subheader("📊 Quantization Strategy Comparison")
-                    
-                    # Create comparison table
-                    comparison_data = {
-                        "Model": ["Baseline (FP32)"] + [
-                            f"{v['metadata'].quantization_method.value.upper()}" 
-                            for v in variant_results
-                        ]
-                    }
-                    
-                    if baseline_metrics.get('Accuracy'):
-                        comparison_data["Accuracy (%)"] = [baseline_metrics['Accuracy']*100] + [
-                            v['metrics'].get('Accuracy', 0)*100 if v['metrics'].get('Accuracy') else None
-                            for v in variant_results
-                        ]
-                    
-                    comparison_data["Latency (ms)"] = [baseline_metrics['Latency (ms)']] + [
-                        v['metrics']['Latency (ms)'] for v in variant_results
-                    ]
-                    
-                    comparison_data["Size (MB)"] = [baseline_metrics['param_MB']] + [
-                        v['metrics']['param_MB'] for v in variant_results
-                    ]
-                    
-                    comparison_df = pd.DataFrame(comparison_data)
-                    st.dataframe(comparison_df, width='stretch')
-                    
-                    # Rankings
-                    st.subheader("🏆 Rankings")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    
-                    # Fastest inference
-                    with col1:
-                        st.markdown("### ⚡ Fastest Inference")
-                        sorted_by_latency = sorted(
-                            variant_results,
-                            key=lambda x: x['metrics']['Latency (ms)']
-                        )
-                        for i, v in enumerate(sorted_by_latency[:3], 1):
-                            st.write(f"{i}. {v['metadata'].quantization_method.value.upper()}: {v['metrics']['Latency (ms)']:.3f} ms")
-                    
-                    # Lowest memory
-                    with col2:
-                        st.markdown("### 💾 Lowest Memory")
-                        sorted_by_size = sorted(
-                            variant_results,
-                            key=lambda x: x['metrics']['param_MB']
-                        )
-                        for i, v in enumerate(sorted_by_size[:3], 1):
-                            st.write(f"{i}. {v['metadata'].quantization_method.value.upper()}: {v['metrics']['param_MB']:.2f} MB")
-                    
-                    # Best accuracy retention
-                    with col3:
-                        st.markdown("### 🎯 Best Accuracy Retention")
-                        if baseline_metrics.get('Accuracy'):
-                            sorted_by_accuracy = sorted(
-                                variant_results,
-                                key=lambda x: x['metrics'].get('Accuracy', 0) if x['metrics'].get('Accuracy') else 0,
-                                reverse=True
-                            )
-                            for i, v in enumerate(sorted_by_accuracy[:3], 1):
-                                acc = v['metrics'].get('Accuracy', 0)
-                                if acc:
-                                    acc_retention = (acc / baseline_metrics['Accuracy']) * 100
-                                    st.write(f"{i}. {v['metadata'].quantization_method.value.upper()}: {acc_retention:.1f}%")
-                    
-                    # Export/Download buttons
-                    st.subheader("💾 Export Results")
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        # Export comparison table as CSV
-                        comparison_data = {
-                            "Model": ["Baseline (FP32)"] + [
-                                f"{v['metadata'].quantization_method.value.upper()}" 
-                                for v in variant_results
-                            ]
-                        }
-                        
-                        if baseline_metrics.get('Accuracy'):
-                            comparison_data["Accuracy (%)"] = [baseline_metrics['Accuracy']*100] + [
-                                v['metrics'].get('Accuracy', 0)*100 if v['metrics'].get('Accuracy') else None
-                                for v in variant_results
-                            ]
-                        
-                        comparison_data["Latency (ms)"] = [baseline_metrics['Latency (ms)']] + [
-                            v['metrics']['Latency (ms)'] for v in variant_results
-                        ]
-                        
-                        comparison_data["Size (MB)"] = [baseline_metrics['param_MB']] + [
-                            v['metrics']['param_MB'] for v in variant_results
-                        ]
-                        
-                        export_df = pd.DataFrame(comparison_data)
-                        csv = export_df.to_csv(index=False)
-                        st.download_button(
-                            label="📥 Download CSV",
-                            data=csv,
-                            file_name=f"quantization_comparison_{metadata.architecture}.csv",
-                            mime="text/csv",
-                            key="download_csv_variants_manual"
-                        )
-                    
-                    with col2:
-                        # Export as JSON
-                        export_data = {
-                            "baseline": baseline_metrics,
-                            "variants": [
-                                {
-                                    "method": v['metadata'].quantization_method.value,
-                                    "metrics": v['metrics']
-                                }
-                                for v in variant_results
-                            ]
-                        }
-                        json_str = json.dumps(export_data, indent=2)
-                        st.download_button(
-                            label="📥 Download JSON",
-                            data=json_str,
-                            file_name=f"quantization_comparison_{metadata.architecture}.json",
-                            mime="application/json",
-                            key="download_json_variants_manual"
-                        )
+                            with st.spinner(f"Loading {selected_hf} from Hugging Face..."):
+                                try:
+                                    hf_model = load_hf_model_by_name(selected_hf, device)
+                                    st.success(f"✅ Loaded online model: {selected_hf}")
+
+                                    # Evaluate HF model
+                                    hf_metrics = evaluate_model_with_metadata(
+                                        hf_model, metadata, eval_samples, latency_runs, latency_warmup, device
+                                    )
+
+                                    variant_results = [{
+                                        "metadata": metadata,
+                                        "metrics": hf_metrics,
+                                        "model": hf_model,
+                                        "source": "huggingface",
+                                        "name": selected_hf
+                                    }]
+
+                                    baseline_metrics = initial_metrics
+
+                                    st.session_state.ib_comparison_results = {
+                                        "baseline_metrics": baseline_metrics,
+                                        "variant_results": variant_results,
+                                        "baseline_metadata": metadata
+                                    }
+                                except Exception as e:
+                                    st.error(f"Failed to load Hugging Face model: {e}")
+                        st.session_state.ib_comparison_type = "variants_comparison"
+                        st.rerun()
+
+                else:
+                    st.info("No similar models found online.")
+
+                # ----------------------------
+                # Option C — fallback stop
+                # ----------------------------
+                st.stop()
             else:
                 st.success(f"✅ Found {len(variants)} quantized variant(s)")
                 
@@ -2125,19 +2451,37 @@ elif internal_mode == "Intelligent Benchmarking":
                     # Recommendation
                     st.subheader("💡 Recommendation")
                     if variant_results:
-                        # Simple recommendation: best balance of speed and accuracy
-                        best_variant = max(
-                            variant_results,
-                            key=lambda x: (
-                                (x['metrics'].get('Accuracy', 0) / baseline_metrics.get('Accuracy', 1)) * 0.5 +
-                                (baseline_metrics['Latency (ms)'] / x['metrics']['Latency (ms)']) * 0.5
-                                if baseline_metrics.get('Accuracy') and x['metrics'].get('Accuracy')
-                                else baseline_metrics['Latency (ms)'] / x['metrics']['Latency (ms)']
-                            )
-                        )
+                        # Recommendation using weighted score across accuracy, latency, and size
+                        def variant_score(v, w_acc=0.5, w_lat=0.3, w_size=0.2):
+                            vm = v['metrics']
+                            try:
+                                if baseline_metrics.get('Accuracy') and vm.get('Accuracy') is not None:
+                                    acc_ratio = vm['Accuracy'] / baseline_metrics['Accuracy']
+                                else:
+                                    acc_ratio = 0.5
+                            except Exception:
+                                acc_ratio = 0.5
+                            try:
+                                lat_ratio = baseline_metrics['Latency (ms)'] / vm['Latency (ms)']
+                            except Exception:
+                                lat_ratio = 1.0
+                            try:
+                                size_ratio = baseline_metrics['param_MB'] / vm['param_MB']
+                            except Exception:
+                                size_ratio = 1.0
+                            if not (isinstance(acc_ratio, (int, float)) and acc_ratio == acc_ratio):
+                                acc_ratio = 0.5
+                            if not (isinstance(lat_ratio, (int, float)) and lat_ratio == lat_ratio):
+                                lat_ratio = 1.0
+                            if not (isinstance(size_ratio, (int, float)) and size_ratio == size_ratio):
+                                size_ratio = 1.0
+                            return w_acc * acc_ratio + w_lat * lat_ratio + w_size * size_ratio
+
+                        best_variant = max(variant_results, key=lambda x: variant_score(x))
+                        score_val = variant_score(best_variant)
                         st.success(
                             f"**Recommended**: {best_variant['metadata'].quantization_method.value.upper()} "
-                            f"for best balance of accuracy retention and speedup"
+                            f"(score={score_val:.3f}) — best combined accuracy/latency/size tradeoff"
                         )
 
                         if user_mode == "Beginner Mode":
@@ -2221,3 +2565,44 @@ elif internal_mode == "Intelligent Benchmarking":
 
 if __name__ == "__main__":
     st.write("Run with: streamlit run ui/app.py")
+
+    # Bottom-of-page: Options & Next Steps (shown after initial evaluation completes)
+    try:
+        if st.session_state.get("ib_analysis_complete"):
+            metadata = st.session_state.get("ib_metadata")
+            arch = getattr(metadata, "architecture", "your model") if metadata is not None else "your model"
+            st.markdown("---")
+            with st.expander("Options & Next Steps", expanded=False):
+                st.write("If you don't have local quantized variants, you can:")
+                st.markdown(f"- **Upload** a baseline/variant (PyTorch `.pt/.pth/.safetensors` or ONNX `.onnx`) to compare with {arch}.")
+                st.markdown("- **Generate** quantized variants locally using the provided scripts.")
+                st.markdown("- **Run a Hugging Face debug search** to see per-query diagnostics when automatic search returns nothing.")
+                st.write("---")
+                uploaded_main = st.file_uploader("Upload a baseline or quantized variant to compare", type=["pt", "pth", "safetensors", "onnx"], key="upload_variant_bottom")
+                if uploaded_main is not None:
+                    tmpdir = os.path.join(".", "uploads")
+                    os.makedirs(tmpdir, exist_ok=True)
+                    out_path = os.path.join(tmpdir, uploaded_main.name)
+                    with open(out_path, "wb") as f:
+                        f.write(uploaded_main.getbuffer())
+                    st.success(f"Saved uploaded model to {out_path}. You can now use the Compare flow to load it as a variant.")
+                with st.expander("Generate quantized variants locally"):
+                    if metadata is not None and "resnet" in getattr(metadata, "architecture", "").lower():
+                        st.code("python scripts/quantize_cifar10_ptq.py", language="bash")
+                        st.code("python scripts/train_cifar10_qat.py", language="bash")
+                    elif metadata is not None and "distilbert" in getattr(metadata, "architecture", "").lower():
+                        st.code("python scripts/quantize_sst2_dynamic.py", language="bash")
+                    st.info("After generating variants, re-run this comparison to see them listed.")
+                with st.expander("Hugging Face debug search"):
+                    if st.button("Run HF debug search", key="hf_debug_bottom"):
+                        try:
+                            from ui.hf_search import search_hf_models_debug
+                            dbg_results, dbg_info = search_hf_models_debug(getattr(metadata, "architecture", ""))
+                            st.write({"queries_tried": dbg_info})
+                            if dbg_results:
+                                st.success("Debug search found candidates — re-run the comparison to surface them.")
+                                st.write(dbg_results)
+                        except Exception as e:
+                            st.error(f"HF debug search failed: {e}")
+    except Exception:
+        pass

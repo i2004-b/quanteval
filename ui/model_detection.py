@@ -367,20 +367,52 @@ def load_generic_pytorch_model(
         if isinstance(checkpoint, nn.Module):
             model = checkpoint
             load_info["model_type"] = "full_model"
-        
-        # Case 2: State dict only
+
+        # Case 2: State dict only (or checkpoint wrapper containing a state_dict)
         elif isinstance(checkpoint, dict):
-            # Check if it looks like a state dict
-            if "state_dict" in checkpoint:
+            # If wrapped checkpoint (e.g., {'state_dict': {...}, 'epoch':..}), extract inner state_dict
+            inner = None
+            if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+                inner = checkpoint["state_dict"]
                 load_info["warnings"].append(
-                    "Found 'state_dict' key in checkpoint. You may need to specify the model architecture separately."
+                    "Found 'state_dict' key in checkpoint. Architecture not included."
                 )
-                load_info["error"] = "State dict with checkpoint wrapper detected. Cannot load without architecture."
+            else:
+                # Heuristic: if the dict values look like tensors/arrays, treat as state_dict
+                sample_vals = list(checkpoint.values())[:5]
+                if all(torch.is_tensor(v) or isinstance(v, np.ndarray) for v in sample_vals):
+                    inner = checkpoint
+
+            if inner is not None:
+                # Compute parameter counts and approximate on-disk size from state_dict contents
+                total_params = 0
+                total_bytes = 0
+                for v in inner.values():
+                    try:
+                        if torch.is_tensor(v):
+                            total_params += v.numel()
+                            # element_size exists for tensors
+                            total_bytes += v.element_size() * v.numel()
+                        elif isinstance(v, np.ndarray):
+                            total_params += v.size
+                            total_bytes += v.nbytes
+                        else:
+                            # skip other values
+                            continue
+                    except Exception:
+                        continue
+
+                load_info["model_type"] = "state_dict_only"
+                load_info["success"] = False
+                load_info["can_run"] = False
+                load_info["state_dict_param_count"] = int(total_params)
+                load_info["state_dict_size_bytes"] = int(total_bytes)
+                load_info["state_dict_size_mb"] = float(total_bytes) / (1024 * 1024)
+                load_info["error"] = "State dict loaded but architecture missing. Inference/profile unavailable."
                 return None, load_info
-            
-            # Otherwise, assume it's a direct state_dict
-            load_info["model_type"] = "state_dict_only"
-            load_info["error"] = "Loaded state_dict without architecture. Please provide model architecture or use built-in models."
+
+            # Otherwise unknown dict type
+            load_info["error"] = "Loaded dict checkpoint but could not interpret as model or state_dict."
             return None, load_info
         
         else:

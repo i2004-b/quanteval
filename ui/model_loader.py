@@ -1,8 +1,11 @@
 # model_loader.py
 import os
 import torch
-from transformers import DistilBertForSequenceClassification
+import glob
+import tempfile
 import torchvision.models as models
+from torchvision.models import resnet18
+from transformers import AutoModelForSequenceClassification, AutoModel
 
 # Get project root directory (parent of ui/)
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -10,6 +13,14 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 def _get_project_path(relative_path):
     """Convert relative path to absolute path based on project root."""
     return os.path.join(_PROJECT_ROOT, relative_path)
+
+
+def _torch_load(path, map_location="cpu"):
+    """Load checkpoint; use weights_only=False on PyTorch 2+ for state dicts."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
 
 ###############################################################################
@@ -23,10 +34,216 @@ def load_hf_model(model_dir, device):
         model_dir = _get_project_path(model_dir)
     if not os.path.exists(model_dir):
         raise FileNotFoundError(f"HuggingFace model directory not found: {model_dir}")
+    try:
+        from transformers import DistilBertForSequenceClassification
+    except Exception as e:
+        raise ImportError("Missing dependency 'transformers'. Install it with `pip install transformers`.") from e
     model = DistilBertForSequenceClassification.from_pretrained(model_dir)
     model.to(device)
     model.eval()
     return model
+
+def load_hf_model_by_name(model_name, device):
+    # Robust loader: try several AutoModel variants in order of likelihood
+    # for common model types (image classification, sequence classification, masked LM, generic).
+    from transformers import (
+        AutoConfig,
+        AutoModel,
+        AutoModelForImageClassification,
+        AutoModelForSequenceClassification,
+        AutoModelForMaskedLM,
+    )
+
+    # Try to inspect config first
+    try:
+        cfg = AutoConfig.from_pretrained(model_name)
+    except Exception:
+        cfg = None
+
+    # Attempt image classification loader first if config hints at vision model
+    tried = []
+    if cfg is not None and getattr(cfg, "model_type", "").lower() in (
+        "mobilenet_v2", "efficientnet", "resnet", "convnext", "beit", "swin", "vit"
+    ):
+        try:
+            model = AutoModelForImageClassification.from_pretrained(model_name)
+            model.to(device)
+            model.eval()
+            return model
+        except Exception as e:
+            tried.append(("AutoModelForImageClassification", str(e)))
+
+    # Try sequence classification
+    try:
+        model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        model.to(device)
+        model.eval()
+        return model
+    except Exception as e:
+        tried.append(("AutoModelForSequenceClassification", str(e)))
+
+    # Try masked LM / encoder models
+    try:
+        model = AutoModelForMaskedLM.from_pretrained(model_name)
+        model.to(device)
+        model.eval()
+        return model
+    except Exception as e:
+        tried.append(("AutoModelForMaskedLM", str(e)))
+
+    # Fallback to generic AutoModel
+    try:
+        model = AutoModel.from_pretrained(model_name)
+        model.to(device)
+        model.eval()
+        return model
+    except Exception as e:
+        tried.append(("AutoModel", str(e)))
+
+    # If we reach here, aggregate attempts and try a secondary fallback.
+    err_msgs = "; ".join([f"{k}: {v}" for k, v in tried])
+
+    # Secondary fallback: some HF repos provide nonstandard checkpoint filenames
+    # (e.g., model.pt, *.pth, or safetensors) and are not consumable via
+    # transformers' from_pretrained. Try downloading the repo and loading any
+    # candidate checkpoint into a torchvision image model (Mobilenet/EfficientNet).
+    def _try_load_hf_checkpoint_as_torchvision(repo_id, device):
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception as e:
+            return None, f"huggingface_hub unavailable: {e}"
+
+        try:
+            repo_dir = snapshot_download(repo_id=repo_id, repo_type="model")
+        except Exception as e:
+            return None, f"snapshot_download failed: {e}"
+
+        # Search for common checkpoint file extensions and other runtime artifacts
+        candidates = []
+        for pat in ("*.pt", "*.pth", "*.bin", "*.safetensors", "*.onnx", "*.tflite", "*.pb", "*.n2x"):
+            candidates.extend(glob.glob(os.path.join(repo_dir, pat)))
+
+        # If no standard candidates, list repository files to provide diagnostics
+        if not candidates:
+            repo_files = []
+            for root, _, files in os.walk(repo_dir):
+                for fn in files:
+                    repo_files.append(os.path.relpath(os.path.join(root, fn), repo_dir))
+            sample = repo_files[:20]
+            return None, f"no checkpoint-like files found in repo; files: {sample} (total {len(repo_files)})"
+
+        # Try loading each candidate file and mapping to a torchvision model
+        for fpath in candidates:
+            # If this is an ONNX model, try to load with onnxruntime and wrap
+            if fpath.lower().endswith(".onnx"):
+                try:
+                    import onnxruntime as ort
+                except Exception as e:
+                    # onnxruntime not available, include in diagnostic
+                    return None, f"onnx model present ({fpath}) but onnxruntime missing: {e}"
+
+                class _ONNXWrapper(torch.nn.Module):
+                    def __init__(self, session):
+                        super().__init__()
+                        self.session = session
+
+                    def to(self, device):
+                        # ONNX runtime runs on CPU/GPU via providers; nothing to move
+                        return self
+
+                    def eval(self):
+                        return self
+
+                    def __call__(self, x):
+                        # Expect a single input; convert torch tensor to numpy
+                        import numpy as _np
+                        if isinstance(x, torch.Tensor):
+                            inp = x.detach().cpu().numpy()
+                        else:
+                            inp = _np.asarray(x)
+                        input_name = self.session.get_inputs()[0].name
+                        outputs = self.session.run(None, {input_name: inp})
+                        # Return first output as torch tensor
+                        out = outputs[0]
+                        return torch.from_numpy(out)
+
+                try:
+                    sess = ort.InferenceSession(fpath, providers=["CPUExecutionProvider"])
+                    wrapper = _ONNXWrapper(sess)
+                    return wrapper, f"loaded ONNX model via onnxruntime from {fpath}"
+                except Exception as e:
+                    continue
+
+            try:
+                if fpath.endswith(".safetensors"):
+                    try:
+                        from safetensors.torch import load_file as safetensors_load
+                        obj = safetensors_load(fpath)
+                    except Exception:
+                        continue
+                else:
+                    obj = torch.load(fpath, map_location="cpu")
+            except Exception:
+                continue
+
+            # If it's a state_dict, try to load into a torchvision mobilenet_v2
+            if isinstance(obj, dict):
+                possible_sds = [obj]
+                if "state_dict" in obj and isinstance(obj["state_dict"], dict):
+                    possible_sds.insert(0, obj["state_dict"])
+                if "model" in obj and isinstance(obj["model"], dict):
+                    possible_sds.insert(0, obj["model"])
+
+                for sd in possible_sds:
+                    try:
+                        tv_model = models.mobilenet_v2(weights=None)
+                    except Exception:
+                        tv_model = models.mobilenet_v2(pretrained=False)
+                    try:
+                        tv_model.load_state_dict(sd, strict=False)
+                        tv_model.to(device)
+                        tv_model.eval()
+                        return tv_model, f"loaded torchvision model from {fpath}"
+                    except Exception:
+                        continue
+
+            # If the object is a full model instance
+            if isinstance(obj, torch.nn.Module):
+                try:
+                    obj.to(device)
+                    obj.eval()
+                    return obj, f"loaded full torch model from {fpath}"
+                except Exception:
+                    continue
+
+        # If we couldn't load any candidate, build actionable diagnostics.
+        exts_set = {os.path.splitext(p)[1].lower() for p in candidates}
+        exts_list = sorted(exts_set)
+        # If only vendor-specific artifacts (e.g., .n2x) are present, return
+        # a clear message explaining conversion options.
+        vendor_exts = {'.n2x'}
+        if exts_set and exts_set.issubset(vendor_exts):
+            model_url = f"https://huggingface.co/{repo_id}"
+            return None, (
+                f"repo contains only vendor-specific artifacts {exts_list}. "
+                f"These formats are not directly loadable by PyTorch/transformers. "
+                f"Check the model page for conversion instructions: {model_url}. "
+                f"You can download the repo locally with: from huggingface_hub import snapshot_download; "
+                f"snapshot_download('{repo_id}'). If the repo provides a converter script or an ONNX export, "
+                f"use that to produce an ONNX (.onnx) or PyTorch checkpoint (.pt/.pth/.safetensors) and re-run the loader."
+            )
+
+        # Otherwise return a general message listing the candidate extensions
+        return None, f"no compatible checkpoint loaded from repo; candidate extensions: {exts_list}"
+
+    fallback_model, fallback_msg = _try_load_hf_checkpoint_as_torchvision(model_name, device)
+    if fallback_model is not None:
+        return fallback_model
+
+    # If fallback failed, raise aggregated error including fallback diagnostic
+    raise RuntimeError(
+        f"Failed to load Hugging Face model '{model_name}'. Attempts: {err_msgs}; fallback: {fallback_msg}"
+    )
 
 def load_resnet18_state_dict(path, device, num_classes=10):
     """
@@ -42,7 +259,7 @@ def load_resnet18_state_dict(path, device, num_classes=10):
     model = models.resnet18(weights=None)  # no pretrained weights
     # Modify final layer for CIFAR-10 (10 classes instead of 1000)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
-    state_dict = torch.load(path, map_location="cpu")
+    state_dict = _torch_load(path)
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
@@ -75,7 +292,7 @@ def load_resnet18_ptq_quantized(path, device, num_classes=10):
     qmodel.eval()
     
     # Load the quantized state dict
-    state_dict = torch.load(path, map_location="cpu")
+    state_dict = _torch_load(path)
     qmodel.load_state_dict(state_dict)
     qmodel.to(device)
     qmodel.eval()
@@ -220,7 +437,7 @@ def load_resnet18_qat_quantized(path, device, num_classes=10):
     qmodel.eval()
     
     # Load the quantized state dict
-    state_dict = torch.load(path, map_location="cpu")
+    state_dict = _torch_load(path)
     missing, unexpected = qmodel.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"[QAT warn] Missing keys (first 5): {list(missing)[:5]}")
@@ -249,6 +466,10 @@ def load_state_dict_model(baseline_dir, state_dict_path, device, is_dynamic_quan
         raise FileNotFoundError(f"State dict file not found: {state_dict_path}")
     
     print("Loading baseline architecture:", baseline_dir)
+    try:
+        from transformers import DistilBertForSequenceClassification
+    except Exception as e:
+        raise ImportError("Missing dependency 'transformers'. Install it with `pip install transformers`.") from e
     model = DistilBertForSequenceClassification.from_pretrained(baseline_dir)
     
     # For dynamic quantized models, we need to apply quantization first
@@ -262,7 +483,7 @@ def load_state_dict_model(baseline_dir, state_dict_path, device, is_dynamic_quan
         model = tq.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
     
     print("Loading state_dict:", state_dict_path)
-    state_dict = torch.load(state_dict_path, map_location="cpu")
+    state_dict = _torch_load(state_dict_path)
     
     # Load with strict=False for quantized models to handle any mismatches
     missing, unexpected = model.load_state_dict(state_dict, strict=not is_dynamic_quantized)
@@ -372,7 +593,37 @@ MODEL_REGISTRY = {
 
 
 ###############################################################################
-# 3) --- MASTER LOADER --------------------------------------------------------
+# 3) --- LOADABLE CHECK (for planner / UI) ------------------------------------
+###############################################################################
+
+def is_model_loadable(model_key: str) -> bool:
+    """
+    Return True if the model key is in the registry and its required file(s) exist.
+    Use this to avoid trying to load variants that don't have files (e.g. not yet generated).
+    """
+    cfg = MODEL_REGISTRY.get(model_key)
+    if cfg is None:
+        return False
+    t = cfg.get("type")
+    if t == "user":
+        return False
+    if t == "hf_dir":
+        p = cfg["path"]
+        path_abs = _get_project_path(p) if not os.path.isabs(p) else p
+        return os.path.exists(path_abs)
+    if t in ("state_dict", "state_dict_dynamic_quant"):
+        p = cfg["path"]
+        path_abs = _get_project_path(p) if not os.path.isabs(p) else p
+        return os.path.exists(path_abs)
+    if t in ("resnet_state_dict", "resnet_ptq_quantized", "resnet_qat_quantized"):
+        p = cfg["path"]
+        path_abs = _get_project_path(p) if not os.path.isabs(p) else p
+        return os.path.exists(path_abs)
+    return False
+
+
+###############################################################################
+# 4) --- MASTER LOADER --------------------------------------------------------
 ###############################################################################
 
 def load_model(model_key, device, user_path=None, user_model_type=None):

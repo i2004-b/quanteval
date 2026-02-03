@@ -48,8 +48,9 @@ class PrecisionType(Enum):
 class QuantizationMethod(Enum):
     """Quantization methods"""
     NONE = "none"  # Baseline FP32
-    DYNAMIC = "dynamic"  # Dynamic quantization (PTQ)
-    STATIC = "static"  # Static quantization (PTQ with calibration)
+    DYNAMIC = "dynamic"  # Dynamic quantization (post-training dynamic)
+    PTQ = "ptq"  # Post-Training Quantization (PTQ)
+    STATIC = "static"  # Static quantization (calibrated / observer-based PTQ)
     QAT = "qat"  # Quantization-Aware Training
     UNKNOWN = "unknown"
 
@@ -162,7 +163,7 @@ def detect_quantization_method(model: nn.Module) -> Tuple[QuantizationMethod, fl
         # Could be static PTQ or QAT - need more context
         # Check if model has quantization stubs (QAT architecture)
         has_stubs = any("quant" in name.lower() or "dequant" in name.lower() 
-                       for name in model.named_modules())
+                       for name, module in model.named_modules())
         if has_stubs:
             return QuantizationMethod.QAT, 0.8
         else:
@@ -400,20 +401,21 @@ def inspect_model_from_registry(
         metadata.dataset = dataset_hint
         metadata.confidence = min(metadata.confidence + 0.1, 1.0)
     
-    # Detect quantization from key
-    if "ptq" in model_key.lower() or "quantized" in model_key.lower():
-        if metadata.quantization_method == QuantizationMethod.NONE:
-            metadata.quantization_method = QuantizationMethod.STATIC
-            metadata.precision = PrecisionType.INT8
-    elif "qat" in model_key.lower():
-        if metadata.quantization_method == QuantizationMethod.NONE:
-            metadata.quantization_method = QuantizationMethod.QAT
-            metadata.precision = PrecisionType.INT8
-    elif "dynamic" in model_key.lower():
-        if metadata.quantization_method == QuantizationMethod.NONE:
-            metadata.quantization_method = QuantizationMethod.DYNAMIC
-            metadata.precision = PrecisionType.INT8
-    elif "baseline" in model_key.lower():
+    # Detect quantization from key (registry hints should take precedence)
+    mk = model_key.lower()
+    if "qat" in mk:
+        metadata.quantization_method = QuantizationMethod.QAT
+        metadata.precision = PrecisionType.INT8
+    elif "ptq" in mk:
+        metadata.quantization_method = QuantizationMethod.PTQ
+        metadata.precision = PrecisionType.INT8
+    elif "quantized" in mk or "static" in mk:
+        metadata.quantization_method = QuantizationMethod.STATIC
+        metadata.precision = PrecisionType.INT8
+    elif "dynamic" in mk:
+        metadata.quantization_method = QuantizationMethod.DYNAMIC
+        metadata.precision = PrecisionType.INT8
+    elif "baseline" in mk:
         metadata.quantization_method = QuantizationMethod.NONE
         metadata.precision = PrecisionType.FP32
     

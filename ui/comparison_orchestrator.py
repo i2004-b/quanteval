@@ -61,8 +61,10 @@ class ComparisonGroup:
             # Generate display name
             if metadata.quantization_method == QuantizationMethod.DYNAMIC:
                 name = f"Dynamic INT8"
+            elif metadata.quantization_method == QuantizationMethod.PTQ:
+                name = f"PTQ INT8"
             elif metadata.quantization_method == QuantizationMethod.STATIC:
-                name = f"Static INT8 (PTQ)"
+                name = f"Static INT8"
             elif metadata.quantization_method == QuantizationMethod.QAT:
                 name = f"QAT INT8"
             else:

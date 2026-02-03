@@ -82,6 +82,11 @@ def beginner_conclusion(
             headline_parts.append(f"Higher accuracy (+{d.accuracy_pp:.2f}pp)")
         else:
             headline_parts.append(f"Lower accuracy ({d.accuracy_pp:.2f}pp)")
+    if d.size_pct is not None:
+        if d.size_pct < 0:
+            headline_parts.append(f"Smaller model size ({abs(d.size_pct):.1f}% smaller)")
+        elif d.size_pct > 0:
+            headline_parts.append(f"Larger model size ({d.size_pct:.1f}% larger)")
 
     if not headline_parts:
         headline = f"Comparison: {candidate_name} vs {baseline_name}"
